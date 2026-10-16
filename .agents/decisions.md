@@ -337,3 +337,19 @@ Reason: Satu perangkat Tailscale hanya bisa aktif di satu akun pada satu waktu (
 Impact: Ada kuota bulanan paket gratis ngrok dan halaman peringatan untuk browser. Tidak ada WAF/rate limit di edge, jadi perlindungan sepenuhnya di gateway. Tanpa penyesuaian IP, semua client akan terlihat sebagai 127.0.0.1 dan limit gagal-auth bisa memblokir semuanya sekaligus; itu sudah ditangani lewat `CLIENT_IP_HEADERS`.
 
 Alternative Considered: Tailscale Funnel (URL `*.ts.net` tetap, gratis, tetapi butuh mengganti akun Tailscale PC ini), Cloudflare Quick Tunnel, Cloudflare Tunnel + domain berbayar (script tetap dipertahankan), LAN saja.
+
+---
+
+## 22. Hardening keamanan sebelum go-live publik
+
+Date: 2026-10-16
+
+Context: Audit keamanan menyeluruh sebelum mengekspos API lewat ngrok. Temuan: (a) `D:\ollama` dan folder project bisa diubah oleh *Authenticated Users* padahal dijalankan sebagai SYSTEM; mesin punya akun non-admin `CodexSandboxOffline`/`CodexSandboxOnline` → eskalasi ke SYSTEM; (b) `image_url` tidak divalidasi (Ollama 0.34 kebetulan menolak URL, tapi gateway tidak menjamin); (c) inspector lokal ngrok (127.0.0.1:4040) merekam header Authorization dan prompt.
+
+Decision: (a) `Protect-AdminOnlyTree D:\ollama` (SYSTEM/Admins Full, Authenticated Users + LocalService RX; file ber-ACL protected seperti `ngrok.yml` dipertahankan) dan service `OllamaGateway` dijalankan sebagai `NT AUTHORITY\LocalService` (baca kode/`.env`, Modify `data/`+`logs/`); (b) `sanitize_chat` hanya menerima `data:image/...;base64,`; (c) `web_addr: false` di config ngrok.
+
+Reason: Pilihan pemilik ("kunci + gateway akun rendah"): Codex tetap bisa mengedit project, tetapi kode yang diubah tidak berjalan dengan hak SYSTEM.
+
+Impact: Diverifikasi: gateway berjalan sebagai LOCAL SERVICE, health monitor (nvidia-smi, SCM, disk), tulis DB, log, stop graceful 0.5 dtk, kill → kembali 7 dtk. Sisa risiko yang diterima: kode project yang diubah akun lain tetap berjalan sebagai LocalService (bisa membaca `ADMIN_KEY`/DB); Ollama di 127.0.0.1:11434 tetap tanpa auth untuk proses lokal.
+
+Alternative Considered: Kunci folder project juga (berisiko mematikan alur kerja Codex), deploy ke salinan terkunci (langkah deploy tambahan), biarkan.
