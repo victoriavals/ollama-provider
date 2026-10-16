@@ -62,12 +62,20 @@ if ($lines -match '^ADMIN_KEY=\s*$') {
 New-Item -ItemType Directory -Force $dataDir, (Join-Path $project 'logs') | Out-Null
 # Use SIDs: names like WORKGROUP\user do not resolve for local accounts.
 $me = '*' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-icacls $envFile /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' "${me}:F" | Out-Null
+# The service runs as LocalService (not SYSTEM): the project folder stays editable for
+# developers/agents, so code changes there must never run with SYSTEM rights.
+# LocalService gets: read on code, .venv and .env; modify on data\ and logs\ only.
+$logDir = Join-Path $project 'logs'
+icacls $envFile /inheritance:r /grant:r "${SidSystem}:F" "${SidAdmins}:F" "${me}:F" "${SidLocalService}:R" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls failed on $envFile" }
-icacls $dataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${me}:(OI)(CI)F" | Out-Null
+icacls $dataDir /inheritance:r /grant:r "${SidSystem}:(OI)(CI)F" "${SidAdmins}:(OI)(CI)F" "${me}:(OI)(CI)F" `
+    "${SidLocalService}:(OI)(CI)M" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls failed on $dataDir" }
 # Existing files (e.g. gateway.db) must inherit from data\ instead of keeping their old ACL.
 if (Get-ChildItem $dataDir -Force) { icacls "$dataDir\*" /reset /T /C | Out-Null }
+icacls $project /grant "${SidLocalService}:(OI)(CI)RX" | Out-Null
+icacls $logDir /grant "${SidLocalService}:(OI)(CI)M" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "icacls failed on $logDir" }
 
 # 4. Service
 # The app writes its own daily logs (logs\gateway-, access-, health-*.log); console output is
@@ -81,7 +89,8 @@ $environment = [ordered]@{
 Install-WinSWService -WinSW $winsw -ServiceDir (Join-Path $Root 'services') -Name 'OllamaGateway' `
     -Exe $basePython -Arguments '-m gateway' -Directory $project -DisplayName 'Ollama Provider Gateway' `
     -Description 'OpenAI-compatible API gateway (API keys, rate limits, usage logs) in front of Ollama' `
-    -Environment $environment -LogDir (Join-Path $project 'logs') -DependsOn 'OllamaServe' -StopTimeoutSec 15
+    -Environment $environment -LogDir $logDir -DependsOn 'OllamaServe' -StopTimeoutSec 15 `
+    -ServiceAccount 'NT AUTHORITY\LocalService'
 
 Write-Step 'Starting OllamaGateway'
 Start-Service OllamaGateway
