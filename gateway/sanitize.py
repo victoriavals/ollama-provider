@@ -122,6 +122,13 @@ def sanitize_chat(body: dict[str, Any], caps: set[str], settings: Settings) -> t
                 if not isinstance(part, dict) or not isinstance(part.get("type"), str):
                     raise bad(f"messages[{i}].content has an invalid part.", param=f"messages[{i}].content")
                 if part["type"] == "image_url":
+                    # Only inline base64 images: never let the server fetch a URL (SSRF), even if a
+                    # future Ollama version starts downloading http(s) image URLs.
+                    image = part.get("image_url")
+                    url = image.get("url") if isinstance(image, dict) else image
+                    if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
+                        raise bad("image_url must be a base64 data URL (data:image/...;base64,...).",
+                                  param=f"messages[{i}].content")
                     images += 1
                 elif part["type"] != "text":
                     raise bad(f"Content part type `{part['type']}` is not supported.",
