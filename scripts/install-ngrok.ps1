@@ -54,6 +54,9 @@ Set-Content -Path $config -Encoding ASCII -Value @(
     'version: "3"',
     'agent:',
     "  authtoken: $AuthToken",
+    # The local inspector (127.0.0.1:4040) records full requests incl. Authorization headers
+    # and prompts, readable by any local user: keep it off.
+    '  web_addr: false',
     'endpoints:',
     '  - name: ollama-provider',
     "    url: https://$Domain",
