@@ -1,0 +1,1 @@
+{"id":"cmpl-706","object":"text_completion","created":1790476982,"model":"gemma3:4b","system_fingerprint":"fp_ollama","choices":[{"text":"The sky is **blue** (most","index":0,"finish_reason":"length"}],"usage":{"prompt_tokens":13,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":8,"total_tokens":21}}
