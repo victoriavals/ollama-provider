@@ -93,7 +93,9 @@ function Install-WinSWService {
         [Collections.IDictionary]$Environment = @{},
         [Parameter(Mandatory)][string]$LogDir,
         [string]$DependsOn = '',
-        [int]$StopTimeoutSec = 15
+        [int]$StopTimeoutSec = 15,
+        # Empty = LocalSystem. Built-in accounts need no password, e.g. 'NT AUTHORITY\LocalService'.
+        [string]$ServiceAccount = ''
     )
     Remove-ServiceIfExists $Name
     New-Item -ItemType Directory -Force $ServiceDir, $LogDir | Out-Null
@@ -134,6 +136,34 @@ function Install-WinSWService {
     Write-Step "Installing service $Name"
     & $wrapper install | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "WinSW install of $Name failed (exit $LASTEXITCODE)" }
+    if ($ServiceAccount) {
+        # Set through the SCM: WinSW v2 ignores the v3-style <serviceaccount><username> element,
+        # and PS 5.1 drops the empty password argument that `sc.exe config obj=` needs (error 1639).
+        Write-Step "Running $Name as $ServiceAccount"
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'"
+        $r = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ StartName = $ServiceAccount; StartPassword = '' }
+        if ($r.ReturnValue -ne 0) { throw "Setting $Name account to $ServiceAccount failed (Win32_Service.Change = $($r.ReturnValue))" }
+    }
+}
+
+$SidSystem = '*S-1-5-18'
+$SidAdmins = '*S-1-5-32-544'
+$SidAuthUsers = '*S-1-5-11'
+$SidLocalService = '*S-1-5-19'
+
+function Protect-AdminOnlyTree([string]$Path) {
+    # Everything under $Path runs as SYSTEM, so only SYSTEM/Administrators may write; everyone
+    # else (incl. non-admin and sandbox accounts) gets read/execute. Files that already carry
+    # their own protected ACL (e.g. ngrok.yml with the authtoken) keep it.
+    if (-not (Test-Path $Path)) { return }
+    Write-Step "Restricting write access on $Path to SYSTEM and Administrators"
+    $protected = @(Get-ChildItem $Path -Recurse -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { $acl = Get-Acl $_.FullName; if ($acl.AreAccessRulesProtected) { @{ Path = $_.FullName; Acl = $acl } } })
+    icacls $Path /inheritance:r /grant:r "${SidSystem}:(OI)(CI)F" "${SidAdmins}:(OI)(CI)F" `
+        "${SidAuthUsers}:(OI)(CI)RX" "${SidLocalService}:(OI)(CI)RX" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $Path" }
+    if (Get-ChildItem $Path -Force) { icacls "$Path\*" /reset /T /C /Q | Out-Null }
+    foreach ($p in $protected) { Set-Acl -Path $p.Path -AclObject $p.Acl }
 }
 
 function Wait-Http([string]$Url, [int]$TimeoutSec = 60) {
