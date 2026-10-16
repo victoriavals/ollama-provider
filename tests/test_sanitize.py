@@ -70,6 +70,20 @@ def test_images_need_vision_and_are_capped():
         sanitize_chat(chat(**_image_msg(1)), {"completion"}, S)
 
 
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:11434/api/tags",
+    "https://example.com/cat.png",
+    "file:///C:/Windows/win.ini",
+    "data:text/plain;base64,AAAA",
+    "data:image/png,not-base64",
+])
+def test_image_url_must_be_inline_base64(url):
+    body = chat(messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}])
+    with pytest.raises(APIError) as exc:
+        sanitize_chat(body, CHAT_CAPS, S)
+    assert exc.value.status_code == 400
+
+
 def test_tools_allowed_when_model_supports_them():
     payload, _ = sanitize_chat(chat(tools=[{"type": "function", "function": {"name": "f"}}]),
                                {"completion", "tools"}, S)
