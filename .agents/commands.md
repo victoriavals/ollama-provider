@@ -58,7 +58,7 @@ curl.exe http://127.0.0.1:18000/v1/chat/completions -H "Authorization: Bearer sk
 ## Testing
 
 ```powershell
-uv run pytest                                    # semua test (66), Ollama di-mock, tanpa jaringan
+uv run pytest                                    # semua test (71), Ollama di-mock, tanpa jaringan
 uv run pytest tests/test_proxy.py -q             # satu file
 uv run pytest -k stream -q                       # filter nama test
 ```
