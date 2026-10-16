@@ -17,7 +17,7 @@
 | Upstream | Ollama (`http://127.0.0.1:11434`), memakai endpoint OpenAI-compat `/v1/*` dan native `/api/*` |
 | Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Windows Service via **WinSW v2.12**, Cloudflare Tunnel |
 | Package manager | `uv` (`uv.lock`) |
-| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **66 test** |
+| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **71 test** |
 | Bahasa dokumentasi | Indonesia (README, `.agents/`), komentar kode dalam Bahasa Inggris |
 
 ## Arsitektur singkat
@@ -51,10 +51,10 @@ Client --HTTPS--> Cloudflare edge --> cloudflared [service Cloudflared]
 2. **Jangan memakai `BaseHTTPMiddleware` atau `GZipMiddleware`**, karena keduanya membuffer streaming SSE. Middleware harus pure ASGI (lihat `gateway/middleware.py`).
 3. **Streaming:** header 200 dikirim segera, disusul ping `: ping` setiap 15 detik saat antre (menghindari 524 Cloudflare). Error yang terjadi setelah header terkirim dikirim sebagai `data: {"error":...}`. Status sebenarnya dicatat lewat `request.state.access["status"]`.
 4. **Slot konkurensi wajib dilepas.** Semua jalur request generasi melewati `Finalizer` (`proxy.py`), yang idempoten dan melepas slot key + slot GPU serta mencatat usage. `ClosingStreamingResponse` memastikan generator di-`aclose()` saat client putus. Endpoint generasi baru harus memakai pola yang sama.
-5. **Service gateway menjalankan base Python** (`C:\Program Files\Python311\python.exe -m gateway`) dengan `PYTHONPATH=<project>;<project>\.venv\Lib\site-packages`, **bukan** `.venv\Scripts\python.exe`. Launcher venv membuat proses kedua yang merusak stop/restart service. Akibatnya file `.pth` di venv tidak diproses (saat ini hanya ada `_virtualenv.pth`, tidak dibutuhkan).
+5. **Service gateway menjalankan base Python** (`C:\Program Files\Python311\python.exe -m gateway`) dengan `PYTHONPATH=<project>;<project>\.venv\Lib\site-packages`, **bukan** `.venv\Scripts\python.exe`. Launcher venv membuat proses kedua yang merusak stop/restart service. Akibatnya file `.pth` di venv tidak diproses (saat ini hanya ada `_virtualenv.pth`, tidak dibutuhkan). Service gateway berjalan sebagai **`NT AUTHORITY\LocalService`** (bukan SYSTEM), karena folder project bisa diedit akun lain (termasuk sandbox Codex). Akun di-set lewat `Win32_Service.Change` (WinSW v2 mengabaikan `<serviceaccount><username>`, dan `sc.exe config obj= ... password= ''` gagal di PS 5.1).
 6. **Wrapper service adalah WinSW, bukan NSSM.** NSSM 2.24 di Windows 11 ini macet di `STOP_PENDING` dan tidak me-restart app yang crash. Di script, hentikan service dengan `Stop-ServiceSafe` (`scripts/common.ps1`), jangan `Stop-Service -Force` (bisa menggantung).
 7. **`OllamaGateway` bergantung pada `OllamaServe`.** SCM menolak menghentikan `OllamaServe` selama gateway masih jalan, jadi hentikan gateway dulu.
-8. **Env var menang atas `.env`** (pydantic-settings). Service men-set `LOG_CONSOLE=false`. `.env` dan `data/` di-ACL hanya untuk SYSTEM, Administrators, dan akun yang menjalankan installer.
+8. **Env var menang atas `.env`** (pydantic-settings). Service men-set `LOG_CONSOLE=false`. `.env` dan `data/` di-ACL hanya untuk SYSTEM, Administrators, dan akun yang menjalankan installer. LocalService mendapat: baca `.env` dan kode, Modify di `data/` dan `logs/`. `D:\ollama` dikunci (`Protect-AdminOnlyTree`): hanya SYSTEM/Administrators yang bisa menulis, karena isinya dijalankan sebagai SYSTEM.
 9. **Cache key 30 detik.** Revoke lewat admin API langsung berlaku (`gw.keys.clear()`), sedangkan lewat CLI baru berlaku paling lambat 30 detik.
 10. **Capability model diambil dari `/api/show`**, bukan `/api/tags` (tags tidak memuat `vision`). Cache-nya 10 menit (`ollama.py`).
 11. **Keanehan Ollama:** stream `/v1/completions` menyertakan `usage` bernilai 0 di setiap chunk. Usage sebenarnya ada di chunk terakhir dengan `choices: []`. Gateway selalu meminta `include_usage` ke upstream, lalu membuang chunk usage kalau client tidak memintanya.
