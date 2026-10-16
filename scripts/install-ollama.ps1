@@ -75,7 +75,10 @@ if ($UninstallTrayApp) {
     }
 }
 
-# 5. Service
+# 5. Binaries, service definitions and models run as SYSTEM: only admins may change them
+Protect-AdminOnlyTree $Root
+
+# 6. Service
 $environment = [ordered]@{
     OLLAMA_HOST              = '127.0.0.1:11434'
     OLLAMA_MODELS            = $models
