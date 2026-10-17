@@ -16,6 +16,7 @@ Baca dokumen `.agents/` lain sebelum menyentuh area terkait:
 | mengganti keputusan yang sudah ada (WinSW vs NSSM, base Python vs launcher venv, winget, format log, ...) | [.agents/decisions.md](.agents/decisions.md) |
 | menjalankan dev/test/deploy/debug | [.agents/commands.md](.agents/commands.md) |
 | menilai status suatu fitur | [.agents/features.md](.agents/features.md) |
+| mengoperasikan server (akses jarak jauh, client baru, insiden, restart), atau butuh konteks pemilik & pekerjaan tertunda | [.agents/operations.md](.agents/operations.md) |
 
 ## Perintah cepat
 
