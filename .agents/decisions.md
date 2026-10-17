@@ -353,3 +353,19 @@ Reason: Pilihan pemilik ("kunci + gateway akun rendah"): Codex tetap bisa menged
 Impact: Diverifikasi: gateway berjalan sebagai LOCAL SERVICE, health monitor (nvidia-smi, SCM, disk), tulis DB, log, stop graceful 0.5 dtk, kill → kembali 7 dtk. Sisa risiko yang diterima: kode project yang diubah akun lain tetap berjalan sebagai LocalService (bisa membaca `ADMIN_KEY`/DB); Ollama di 127.0.0.1:11434 tetap tanpa auth untuk proses lokal.
 
 Alternative Considered: Kunci folder project juga (berisiko mematikan alur kerja Codex), deploy ke salinan terkunci (langkah deploy tambahan), biarkan.
+
+---
+
+## 23. Dashboard admin web: lokal, tanpa dependency
+
+Date: 2026-10-16
+
+Context: Pemilik meminta dashboard untuk mengontrol provider dengan lebih mudah.
+
+Decision: Halaman statis (`gateway/static/dashboard/`) disajikan oleh app admin di `127.0.0.1:8001/admin/ui`, memakai admin API yang sudah ada (+ `/admin/info`, `group_by=hour`). Vanilla JS/CSS tanpa framework, tanpa CDN, tanpa build step. CSP ketat, `TrustedHostMiddleware` (`ADMIN_ALLOWED_HOSTS`), admin key di `sessionStorage`. URL publik dibaca dari `PUBLIC_BASE_URL` di `.env` (diisi `install-ngrok.ps1`), supaya domain tidak masuk repo.
+
+Reason: Halaman ini memegang `ADMIN_KEY`, jadi tidak boleh memuat kode pihak ketiga. Dengan tetap di port loopback, dashboard tidak menambah permukaan serangan dari internet. Tanpa build step, cocok dengan deploy "restart service".
+
+Impact: Akses dari jarak jauh harus lewat remote desktop. Kontrol service (start/stop) sengaja tidak ada di dashboard, karena gateway berjalan sebagai LocalService tanpa hak mengatur service; gunakan script PowerShell.
+
+Alternative Considered: Framework SPA + Chart.js dari CDN, mengekspos dashboard lewat ngrok dengan login.
