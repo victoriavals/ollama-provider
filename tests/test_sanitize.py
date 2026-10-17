@@ -103,3 +103,37 @@ def test_embeddings_need_capability():
     assert exc.value.code == "model_not_supported"
     payload = sanitize_embeddings({"model": "e", "input": ["a", "b"], "keep_alive": -1}, {"embedding"}, S)
     assert payload == {"model": "e", "input": ["a", "b"]}
+
+
+THINKING_CAPS = {"completion", "vision", "tools", "thinking"}
+
+
+def test_thinking_model_gets_default_reasoning_effort():
+    payload, _ = sanitize_chat(chat(), THINKING_CAPS, S)
+    assert payload["reasoning_effort"] == "none"  # default keeps answers from being eaten by thinking
+    payload, _ = sanitize_chat(chat(reasoning_effort="high"), THINKING_CAPS, S)
+    assert payload["reasoning_effort"] == "high"  # explicit client choice wins
+    model_default = Settings(_env_file=None, default_reasoning_effort="")
+    payload, _ = sanitize_chat(chat(), THINKING_CAPS, model_default)
+    assert "reasoning_effort" not in payload  # "" = leave it to the model
+
+
+def test_reasoning_effort_validated_and_dropped_for_non_thinking_models():
+    with pytest.raises(APIError) as exc:
+        sanitize_chat(chat(reasoning_effort="banana"), THINKING_CAPS, S)
+    assert exc.value.param == "reasoning_effort"
+    with pytest.raises(APIError):  # "low" runs away to max_tokens on qwen3.5:4b, so it is refused
+        sanitize_chat(chat(reasoning_effort="low"), THINKING_CAPS, S)
+    payload, _ = sanitize_chat(chat(reasoning_effort="high"), CHAT_CAPS, S)
+    assert "reasoning_effort" not in payload
+
+
+def test_completions_rejected_for_thinking_models():
+    with pytest.raises(APIError) as exc:
+        sanitize_completion({"model": "qwen3.5:4b", "prompt": "Halo"}, THINKING_CAPS, S)
+    assert exc.value.code == "model_not_supported" and "chat/completions" in exc.value.message
+
+
+def test_invalid_default_reasoning_effort_setting():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, default_reasoning_effort="max")
