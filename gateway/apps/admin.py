@@ -2,11 +2,14 @@
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..auth import display_prefix, generate_key, hash_key, require_admin
 from ..config import BASE_DIR
@@ -101,7 +104,7 @@ async def usage(
     since: str | None = Query(None, description="ISO date/time (UTC). Default: 7 days ago."),
     until: str | None = None,
     key_id: int | None = None,
-    group_by: Literal["day", "key", "model"] = "day",
+    group_by: Literal["hour", "day", "key", "model"] = "day",
 ) -> dict:
     since_iso = _iso(since, "since") if since else days_ago(7)
     until_iso = _iso(until, "until") if until else None
@@ -193,6 +196,19 @@ async def status(request: Request) -> dict:
     return await _gw(request).health.check()
 
 
+@router.get("/info")
+async def info(request: Request) -> dict:
+    """Static facts the dashboard needs (public URL, default limits, enabled models)."""
+    gw = _gw(request)
+    s = gw.settings
+    return {
+        "public_base_url": s.public_base_url or None,
+        "defaults": {"rpm": s.default_rpm, "max_concurrent": s.default_max_concurrent,
+                     "global_concurrency": s.global_concurrency, "max_tokens_cap": s.max_tokens_cap},
+        "models": [m["name"] for m in await gw.db.enabled_models()],
+    }
+
+
 @router.post("/backup")
 async def backup(request: Request) -> dict:
     dest = BASE_DIR / "data" / "backups" / f"gateway-{datetime.now():%Y%m%d-%H%M%S}.db"
@@ -201,11 +217,46 @@ async def backup(request: Request) -> dict:
     return {"path": str(dest)}
 
 
+# ---- Dashboard (static files, no secrets: the page asks for ADMIN_KEY itself) --
+
+UI_DIR = Path(__file__).resolve().parent.parent / "static" / "dashboard"
+UI_FILES = {"app.js": "text/javascript", "app.css": "text/css"}
+# The page holds the admin key in memory: no third-party code, no framing, no inline script.
+UI_HEADERS = {
+    "Content-Security-Policy": ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+ui = APIRouter(include_in_schema=False)
+
+
+@ui.get("/")
+async def ui_root() -> RedirectResponse:
+    return RedirectResponse("/admin/ui")
+
+
+@ui.get("/admin/ui")
+async def ui_index() -> FileResponse:
+    return FileResponse(UI_DIR / "index.html", media_type="text/html", headers=UI_HEADERS)
+
+
+@ui.get("/admin/ui/{name}")
+async def ui_asset(name: str) -> FileResponse:
+    if name not in UI_FILES:
+        raise APIError(404, "Not Found")
+    return FileResponse(UI_DIR / name, media_type=UI_FILES[name], headers=UI_HEADERS)
+
+
 def create_admin_app(gw: Gateway) -> FastAPI:
     app = FastAPI(title="ollama-provider admin", docs_url="/admin/docs", redoc_url=None,
                   openapi_url="/admin/openapi.json")
     app.state.gw = gw
     install_handlers(app)
     app.add_middleware(RequestContextMiddleware, app_name="admin", ip_headers=gw.settings.client_ip_header_list)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=gw.settings.admin_allowed_host_list)
     app.include_router(router)
+    app.include_router(ui)
     return app
