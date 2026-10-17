@@ -57,19 +57,34 @@ function Install-CloudflaredMsi {
 
 function Stop-ServiceSafe([string]$Name, [int]$TimeoutSec = 60) {
     # Never block forever: stop, wait, and as a last resort kill the service process tree.
-    $svc = Get-Service $Name -ErrorAction SilentlyContinue
-    if (-not $svc -or $svc.Status -eq 'Stopped') { return }
-    Write-Step "Stopping $Name"
-    sc.exe stop $Name | Out-Null
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        if ((Get-Service $Name).Status -eq 'Stopped') { return }
-        Start-Sleep -Milliseconds 250
+    try {
+        $svc = Get-Service $Name -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq 'Stopped') { return }
+        Write-Step "Stopping $Name"
+        sc.exe stop $Name | Out-Null
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            if ((Get-Service $Name).Status -eq 'Stopped') { return }
+            Start-Sleep -Milliseconds 250
+        }
+        $hostPid = (Get-CimInstance Win32_Service -Filter "Name='$Name'").ProcessId
+        Write-Warning "$Name did not stop within $TimeoutSec s; killing process tree of PID $hostPid"
+        if ($hostPid) { taskkill /PID $hostPid /T /F | Out-Null }
+        Start-Sleep -Seconds 2
+    } finally {
+        if ($Name -eq 'OllamaServe') { Remove-OrphanOllamaRunners }
     }
-    $hostPid = (Get-CimInstance Win32_Service -Filter "Name='$Name'").ProcessId
-    Write-Warning "$Name did not stop within $TimeoutSec s; killing process tree of PID $hostPid"
-    if ($hostPid) { taskkill /PID $hostPid /T /F | Out-Null }
-    Start-Sleep -Seconds 2
+}
+
+function Remove-OrphanOllamaRunners {
+    # llama-server.exe runners whose parent ollama.exe died (crash, hard kill) keep holding VRAM.
+    $alive = @{}
+    Get-CimInstance Win32_Process | ForEach-Object { $alive[[int]$_.ProcessId] = $true }
+    Get-CimInstance Win32_Process -Filter "Name='llama-server.exe'" | Where-Object { -not $alive.ContainsKey([int]$_.ParentProcessId) } |
+        ForEach-Object {
+            Write-Warning "Killing orphaned Ollama runner llama-server.exe (PID $($_.ProcessId)) that still holds VRAM"
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
 }
 
 function Remove-ServiceIfExists([string]$Name) {
