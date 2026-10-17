@@ -85,7 +85,7 @@ async def public(gw):
 @pytest.fixture
 async def admin(gw):
     transport = httpx.ASGITransport(app=create_admin_app(gw))
-    async with httpx.AsyncClient(transport=transport, base_url="http://admin",
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8001",
                                  headers={"Authorization": f"Bearer {ADMIN_KEY}"}) as client:
         yield client
 
