@@ -103,8 +103,8 @@ models                                berdiri sendiri; usage_logs.model menyimpa
 7. Perubahan schema bersifat aditif (kolom baru nullable/berdefault) demi backward compatibility dengan DB yang sudah ada dan CLI.
 8. File DB dan `-wal`/`-shm` bersifat sensitif (hash key, IP client) dan tidak boleh di-commit (`data/` ada di `.gitignore`).
 
-## Isi saat ini *(observasi mesin, 2026-09-27)*
+## Isi saat ini *(observasi mesin, 2026-10-18)*
 
-- `api_keys`: 2 baris (key uji `smoke-test`, `smoke-test-2`, keduanya sudah di-revoke). Belum ada key client produksi.
-- `models`: `gemma3:4b` (enabled).
-- `usage_logs`: 4 baris dari uji end-to-end.
+- `api_keys`: 9 baris. **1 key aktif** (milik pemilik, dipakai dari luar lewat ngrok); 8 lainnya key uji agent (`smoke-test*`, `security-probe`, `acl-check*`, `public-check`, `upgrade-check`, `model-e2e`) yang sudah dicabut. Agent membuat key uji sementara lalu langsung mencabutnya, dan pola itu dipertahankan.
+- `models`: `gemma3:4b` (enabled) dan `qwen3.5:4b` (enabled).
+- `usage_logs`: ~40 baris (uji agent + pemakaian awal pemilik).
