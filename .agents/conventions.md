@@ -28,7 +28,8 @@ Konvensi di bawah diambil dari kode yang ada. Ikuti pola ini saat menambah kode.
 gateway/            paket aplikasi (satu modul = satu tanggung jawab)
 gateway/apps/       FastAPI app factory + route (tipis; panggil modul di gateway/)
 scripts/            PowerShell deploy/ops; semua dot-source common.ps1
-tests/              pytest; fixtures/ berisi respons asli Ollama 0.34
+tests/              pytest; fixtures/ berisi respons asli Ollama 0.34 dan chat_stream_ollama040.txt (0.40, ada field `timings`)
+gateway/static/     dashboard admin statis (lihat Dashboard rules)
 data/  logs/        runtime, gitignored, jangan di-commit
 .agents/            memory untuk AI agent (dokumen ini)
 ```
@@ -102,6 +103,16 @@ data/  logs/        runtime, gitignored, jangan di-commit
 - Setting test via `make_settings()`: `health_interval_s=0`, `watch_services=""`, `log_dir=tmp_path/"logs"`, `warmup=False`. Test tidak boleh menyentuh service, GPU, atau jaringan sungguhan (kecuali `test_service_states_on_windows`, yang di-skip di non-Windows).
 - Respons Ollama baru → simpan respons asli di `tests/fixtures/`.
 - Periksa access log lewat `caplog` pada logger `gateway.access`.
+
+## Dashboard rules (`gateway/static/dashboard/`)
+
+- Vanilla HTML/CSS/JS tanpa framework, build step, CDN, atau font eksternal. CSP `script-src 'self'; style-src 'self'` melarang script/style inline, jadi semua JS ada di `app.js` dan CSS di `app.css`. Style dinamis hanya lewat CSSOM (`el.style.width = ...`), bukan atribut `style`.
+- Bangun DOM dengan helper `h()` / `s()` dan `textContent`. **Dilarang** `innerHTML` / `insertAdjacentHTML` (dicek `test_dashboard_is_served_with_strict_headers`).
+- Warna, ukuran, dan spasi hanya dari token CSS di `:root` (`--surface-*`, `--ink*`, `--accent*`, status `--good/--warning/--serious/--critical`), dengan varian `prefers-color-scheme: dark`. Status selalu ikon + teks, tidak pernah warna saja.
+- Copy UI dalam Bahasa Indonesia, sentence case; tombol menyebut aksinya ("Buat key", "Cabut key").
+- Semua panggilan lewat `api()` (Bearer admin key dari `sessionStorage`); 401 → kembali ke layar login. Data baru dari backend ditambahkan ke admin API, bukan diambil langsung dari Ollama.
+- File baru harus didaftarkan di `UI_FILES` (`apps/admin.py`); route aset memakai whitelist.
+- Setelah mengubah tampilan: `node --check gateway/static/dashboard/app.js`, lalu screenshot desktop/ponsel (Edge headless via Playwright `channel="msedge"`) dan pastikan tidak ada overflow maupun error console.
 
 ## PowerShell script rules
 
