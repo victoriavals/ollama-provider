@@ -6,19 +6,49 @@
 
 | Server | Bind | App factory | Diekspos ke internet? |
 |---|---|---|---|
-| Publik | `127.0.0.1:8000` | `create_public_app()` di `gateway/apps/public.py` | Ya, lewat Cloudflare Tunnel (path `^/(v1\|health)(/.*)?$`) |
-| Admin | `127.0.0.1:8001` | `create_admin_app()` di `gateway/apps/admin.py` | **Tidak pernah** |
+| Publik | `127.0.0.1:8000` | `create_public_app()` di `gateway/apps/public.py` | Ya, lewat tunnel **ngrok** (aktif, service `NgrokTunnel`). Cloudflare Tunnel tersedia sebagai alternatif berbayar (butuh domain, path `^/(v1\|health)(/.*)?$`) |
+| Admin | `127.0.0.1:8001` | `create_admin_app()` di `gateway/apps/admin.py` | **Tidak pernah**. Pemilik membukanya lewat SSH port forward |
 
-Upstream-nya Ollama di `127.0.0.1:11434` (service terpisah). Tidak ada frontend.
+Upstream-nya Ollama di `127.0.0.1:11434` (service terpisah). Satu-satunya frontend adalah dashboard admin statis di `/admin/ui` (port 8001, lihat [Dashboard](#dashboard-frontend)).
 
 ```
-                  +------------------------ proses OllamaGateway ------------------------+
-Client -> CF -> cloudflared -> :8000 public app --+                                        |
-                                                  +--> Gateway (core.py) --> OllamaClient --+--> Ollama :11434
-Operator (lokal) ---------> :8001 admin app ------+     |  db (SQLite) | limits | keys      |
-                                                        |  pulls | health | usage writer    |
-                  +---------------------------------------------------------------------+
+                       +--------------------- proses OllamaGateway (LocalService) -----------------+
+Client -HTTPS-> ngrok edge -> ngrok agent -> :8000 public app --+                                    |
+                (NgrokTunnel, SYSTEM)                           +--> Gateway (core.py) --> OllamaClient --+--> Ollama :11434
+Pemilik -SSH (Tailscale) -L 8001-> :8001 admin app + /admin/ui -+     db | limits | keys | pulls      |    (OllamaServe, SYSTEM)
+                                                                      health | usage writer           |
+                       +----------------------------------------------------------------------------+
 ```
+
+## Topologi runtime (Windows Service)
+
+| Service | Akun | Executable | Bergantung pada | Log |
+|---|---|---|---|---|
+| `OllamaServe` | LocalSystem | `D:\ollama\bin\ollama.exe serve` (runner anak: `llama-server.exe`) | - | `D:\ollama\logs\OllamaServe.*.log` |
+| `OllamaGateway` | **NT AUTHORITY\LocalService** | `C:\Program Files\Python311\python.exe -m gateway` + `PYTHONPATH` ke `.venv\Lib\site-packages` | `OllamaServe` | `logs\gateway-/access-/health-*.log`, `logs\OllamaGateway.*.log` |
+| `NgrokTunnel` | LocalSystem | `D:\ollama\ngrok\ngrok.exe start --all --config D:\ollama\ngrok\ngrok.yml` | - | `D:\ollama\logs\ngrok\` |
+| `Cloudflared` | LocalSystem | *(belum terpasang; alternatif)* | - | `D:\ollama\logs\cloudflared\` |
+
+- Semua dibungkus **WinSW v2.12** (exe + XML per service di `D:\ollama\services`), start otomatis, restart saat crash (5/10/30 dtk), stop graceful lewat Ctrl+C.
+- `D:\ollama` hanya bisa ditulis SYSTEM/Administrators (`Protect-AdminOnlyTree`). Gateway memakai akun hak rendah karena folder project bisa diedit akun lain.
+- Setelah boot, semua service start sendiri tanpa login (teruji 2026-10-17 saat Windows Update me-restart PC). Warm-up memuat `gemma3:4b` (~40 dtk pada boot pertama setelah update).
+
+## Model & mode berpikir
+
+- Allowlist aktif (tabel `models`): `gemma3:4b` (utama) dan `qwen3.5:4b` (tools/JSON). `OLLAMA_MAX_LOADED_MODELS=1`: hanya satu model di VRAM, dan berpindah model memicu muat ulang ~4 dtk.
+- Warm-up dan re-warm memilih model aktif pertama secara alfabet (`enabled_models()` diurutkan nama), yaitu `gemma3:4b`. Kalau model utama berganti, perlu setting eksplisit (`PRIMARY_MODEL` belum ada).
+- Capability dari `/api/show` menentukan perilaku `sanitize.py`: `vision` (gambar base64), `tools`, `thinking` (`reasoning_effort` disuntik `DEFAULT_REASONING_EFFORT`; `/v1/completions` ditolak), `embedding`.
+
+## Dashboard (frontend)
+
+- File statis di `gateway/static/dashboard/` (`index.html`, `app.css`, `app.js`), disajikan app admin di `/admin/ui` tanpa auth. Halaman meminta `ADMIN_KEY` lalu memanggil admin API dengan header Bearer.
+- Vanilla JS (ES module) tanpa framework, build step, atau CDN. DOM dibangun lewat helper `h()`/`s()` dengan `textContent`; `innerHTML` dilarang (dicek test). Grafik SVG buatan sendiri.
+- Keamanan: CSP `default-src 'none'; script-src 'self'; style-src 'self'; ... frame-ancestors 'none'`, `X-Frame-Options: DENY`, `Cache-Control: no-store`, `TrustedHostMiddleware` (`ADMIN_ALLOWED_HOSTS`, anti DNS rebinding), admin key di `sessionStorage`.
+- Polling: status tiap 10 dtk. Halaman Ringkasan dan Request diperbarui otomatis; form tidak pernah di-reset saat polling. Admin GET yang sukses tidak dicatat di access log.
+
+## Resolusi IP client
+
+`RequestContextMiddleware` menghitung IP sekali per request (`request.state.client_ip`) dari header pertama yang ada di `CLIENT_IP_HEADERS` (default `cf-connecting-ip,x-forwarded-for`). Untuk `X-Forwarded-For` dipakai entri **terakhir**, yaitu yang ditambahkan agen tunnel (ngrok). Header ini hanya dipercaya karena port 8000 cuma bisa dicapai proses lokal.
 
 ## Entry point & lifecycle (`gateway/__main__.py`)
 
@@ -63,7 +93,8 @@ RequestContextMiddleware  (buat request_id, state.access = {})
        2. read_json_body (hitung byte)     -> 413 / 400
        3. require_model + is_model_enabled -> 404 model_not_found
        4. ollama.capabilities(model)       -> /api/show (cache 10 menit)
-       5. sanitize_chat/completion/embeddings -> 400 (payload hanya berisi field allowlist)
+       5. sanitize_chat/completion/embeddings -> 400 (payload hanya berisi field allowlist;
+          model `thinking` diberi reasoning_effort default, /v1/completions ditolak untuknya)
        6. gate.try_acquire_key             -> 429 concurrency_limit_exceeded
           (setiap APIError di langkah 1-6 -> UsageRecord dengan status error)
        7a. stream=false -> forward_json():
@@ -155,7 +186,9 @@ Yang dicatat hanya **perubahan** status (`is down` / `recovered`). Snapshot JSON
 | Ollama native | `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/pull`, `/api/delete`, `/api/generate` (warm-up) | `ollama.py` |
 | NVIDIA driver | subprocess `nvidia-smi` | `health.gpu_stats` |
 | Windows SCM | ctypes `advapi32` | `health.service_states` |
-| Cloudflare Tunnel | Service `cloudflared` (token, remotely-managed). Header `CF-Connecting-IP` dipercaya untuk IP client | `scripts/install-cloudflared.ps1`, `middleware.scope_client_ip` |
+| **ngrok (aktif)** | Service `NgrokTunnel`, domain statis gratis `*.ngrok-free.dev` (config `D:\ollama\ngrok\ngrok.yml` berisi authtoken, ber-ACL, `web_addr: false`). IP client dari `X-Forwarded-For` (entri terakhir) | `scripts/install-ngrok.ps1`, `middleware.scope_client_ip` |
+| Cloudflare Tunnel (alternatif, belum terpasang) | Service `cloudflared` (token, remotely-managed). Header `CF-Connecting-IP` dipercaya untuk IP client | `scripts/install-cloudflared.ps1` |
+| Tailscale (di luar project) | Dipakai pemilik untuk SSH ke PC ini. Profil terikat akun Windows "User" tanpa *Run unattended* | - |
 | WinSW v2.12 | Wrapper Windows Service (XML di `D:\ollama\services`) | `scripts/common.ps1` |
 
 Timeout `httpx`: connect 5 dtk, read 300 dtk, write 30 dtk, pool 30 dtk. Limit koneksi 100 (keep-alive 20).
@@ -173,8 +206,9 @@ Timeout `httpx`: connect 5 dtk, read 300 dtk, write 30 dtk, pool 30 dtk. Limit k
 ## Aturan arsitektur
 
 1. Semua endpoint yang meneruskan ke Ollama wajib: auth → RPM → validasi/sanitasi → slot key → slot global (dengan batas tunggu) → `Finalizer`.
-2. Jangan menambah listener yang bind ke `0.0.0.0`. Semua bind ke `127.0.0.1`; akses luar hanya lewat cloudflared.
+2. Jangan menambah listener yang bind ke `0.0.0.0`. Semua bind ke `127.0.0.1`; akses luar hanya lewat agen tunnel (ngrok, atau cloudflared bila dipasang).
 3. Route admin tidak boleh dipasang di app publik, begitu pula sebaliknya.
 4. `GLOBAL_CONCURRENCY` harus sama dengan `OLLAMA_NUM_PARALLEL` (di XML service `OllamaServe`).
-5. Request non-stream harus selesai < 100 dtk (batas first-byte Cloudflare), yang dijaga lewat `MAX_TOKENS_CAP`.
+5. Request non-stream sebaiknya selesai < 100 dtk (batas first-byte Cloudflare; dijaga lewat `MAX_TOKENS_CAP`), supaya tetap aman bila tunnel dipindah ke Cloudflare.
 6. Kode baru yang blocking harus lewat `asyncio.to_thread`. Event loop dipakai bersama oleh kedua server.
+7. Dashboard tetap statis dan tanpa dependency pihak ketiga. Fitur baru memakai admin API yang ada, bukan endpoint publik.
