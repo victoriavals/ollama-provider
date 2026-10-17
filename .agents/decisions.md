@@ -382,7 +382,7 @@ Decision: `gemma3:4b` tetap model utama (warm-up), `qwen3.5:4b` diaktifkan sebag
 
 Reason: Hasil terukur: gemma3:4b 100% GPU, 84 tok/dtk, bahasa Indonesia paling natural (meski salah fakta ibu kota Kaltim). qwen3.5:4b 100% GPU, 76 tok/dtk, VRAM lebih hemat, tools berfungsi, tetapi tanpa berpikir lebih sering salah nuansa (“postponed” → “dibatalkan”, arti “PHP”) dan sesekali berhalusinasi; dengan berpikir default 7/10 jawaban kosong karena token habis. `reasoning_effort: "low"` selalu berpikir sampai 2048 token tanpa jawaban; `medium` 2/5 macet. qwen3.5:9b paling akurat tetapi hanya 87% di GPU (VRAM total 7,3 GB), 41 tok/dtk.
 
-Impact: Client memilih model per request. Berpindah model memicu muat ulang ~4 dtk karena `OLLAMA_MAX_LOADED_MODELS=1` (dua model tidak muat bersamaan). Client yang ingin berpikir harus mengirim `reasoning_effort` + `max_tokens` besar. Uji hanya 10 soal sekali jalan, jadi hasilnya arah, bukan kepastian.
+Impact: Client memilih model per request. Berpindah model memicu muat ulang ~4 dtk karena `OLLAMA_MAX_LOADED_MODELS=1` (dua model tidak muat bersamaan). Client yang ingin berpikir harus mengirim `reasoning_effort` + `max_tokens` besar. Uji hanya 10 soal sekali jalan, jadi hasilnya arah, bukan kepastian. Uji kapasitas 2026-10-18 menemukan Ollama 0.40.5 hanya menjalankan 1 request qwen sekaligus (arsitektur `qwen35`), sehingga beban paralel sebaiknya diarahkan ke gemma3 ([operations.md#kapasitas](operations.md#kapasitas)).
 
 Alternative Considered: Ganti total ke qwen3.5:4b, tetap gemma3 saja, qwen3.5:9b (spill ke CPU), `DEFAULT_REASONING_EFFORT=low/medium` (macet).
 
