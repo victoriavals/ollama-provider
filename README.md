@@ -156,6 +156,18 @@ Field yang diteruskan ke Ollama hanya: `model, messages, prompt, input, stream, 
 
 Pada streaming, header sudah terkirim duluan (ada ping `: ping` setiap 15 detik saat antre). Karena itu error dikirim sebagai event `data: {"error": {...}}`, dan SDK OpenAI akan me-raise-nya sebagai exception. Setiap respons membawa header `x-request-id` dan `x-ratelimit-*-requests`.
 
+## Dashboard (lokal)
+
+Buka **http://127.0.0.1:8001/admin/ui** di browser **pada PC server**, lalu masuk dengan `ADMIN_KEY` dari `.env`:
+
+```powershell
+Select-String '^ADMIN_KEY=' .env
+```
+
+Isinya: status dependency + meter slot GPU, pemakaian hari ini, grafik request per jam, cara akses untuk client (URL publik dari `PUBLIC_BASE_URL` di `.env`), kelola API key (buat/ubah batas/cabut), pemakaian per key/model/hari, request terbaru (otomatis diperbarui), serta unduh/aktifkan/hapus model.
+
+Dashboard **tidak bisa dibuka dari internet**: ia berjalan di port admin 8001 yang hanya mendengarkan `127.0.0.1` dan tidak dilewatkan ngrok. Halaman menolak Host header asing (anti DNS rebinding), memakai CSP ketat tanpa script pihak ketiga, dan admin key hanya disimpan di `sessionStorage` tab tersebut. Untuk membukanya dari jauh, pakai remote desktop ke PC server.
+
 ## Admin API (lokal, `http://127.0.0.1:8001`)
 
 Header: `Authorization: Bearer <ADMIN_KEY dari .env>`. Dokumentasi interaktif tersedia di `http://127.0.0.1:8001/admin/docs`.
