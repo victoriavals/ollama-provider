@@ -169,3 +169,16 @@ async def test_client_disconnect_mid_stream_releases_slots_and_logs_499(gw, olla
     assert gw.gate.snapshot() == {"global_limit": 2, "active": 0, "waiting": 0, "per_key_in_flight": {}}
     [row] = await flush_usage(gw)
     assert row["status_code"] == 499 and row["stream"] == 1
+
+
+async def test_stream_from_ollama_040_with_timings(public, auth, gw, ollama):
+    # Ollama 0.40 adds a `timings` object to stream chunks; the usage chunk and [DONE] are unchanged.
+    ollama.post("/v1/chat/completions").respond(
+        200, content=fixture_text("chat_stream_ollama040.txt").encode(), headers={"Content-Type": "text/event-stream"})
+    r = await public.post("/v1/chat/completions", headers=auth, json={**CHAT, "stream": True})
+    data = sse_data(r.text)
+    assert data[-1] == "[DONE]"
+    chunks = [json.loads(d) for d in data[:-1]]
+    assert chunks and all(c["choices"] for c in chunks)  # usage-only chunk stripped
+    [row] = await flush_usage(gw)
+    assert row["status_code"] == 200 and row["total_tokens"] and row["total_tokens"] > 0
