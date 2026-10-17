@@ -115,7 +115,7 @@ Pemetaan error transport (`proxy.map_transport_error`): ConnectError/ConnectTime
 | GET | `/admin/keys?include_revoked=` | Daftar key (tanpa hash) + `*_effective` |
 | PATCH | `/admin/keys/{id}` | Ubah `name`/`rpm_limit`/`max_concurrent` (`null` = kembali ke default) |
 | DELETE | `/admin/keys/{id}` | Revoke (soft delete) dan kosongkan `KeyCache` |
-| GET | `/admin/usage?since&until&key_id&group_by=day\|key\|model` | Ringkasan (default 7 hari) |
+| GET | `/admin/usage?since&until&key_id&group_by=hour\|day\|key\|model` | Ringkasan (default 7 hari) |
 | GET | `/admin/usage/recent?limit&key_id` | Baris `usage_logs` terbaru |
 | GET | `/admin/models` | Gabungan `/api/tags` dan allowlist DB |
 | PATCH | `/admin/models/{name:path}` | `{"enabled": bool}`. Enable hanya untuk model yang terinstal |
@@ -124,6 +124,8 @@ Pemetaan error transport (`proxy.map_transport_error`): ConnectError/ConnectTime
 | DELETE | `/admin/models/{name:path}` | Hapus di Ollama + hapus dari allowlist |
 | GET | `/admin/status` | `HealthMonitor.check()` live |
 | POST | `/admin/backup` | `VACUUM INTO data/backups/gateway-<ts>.db` |
+| GET | `/admin/info` | URL publik (`PUBLIC_BASE_URL`), batas default, model aktif |
+| GET | `/admin/ui`, `/admin/ui/app.js`, `/admin/ui/app.css` | Dashboard statis (tanpa auth; halaman meminta `ADMIN_KEY`), header CSP ketat. `GET /` → redirect ke sini |
 
 Swagger admin tersedia di `/admin/docs` (tanpa auth, tapi hanya bisa diakses dari loopback).
 
