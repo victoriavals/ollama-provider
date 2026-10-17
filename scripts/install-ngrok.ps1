@@ -80,8 +80,10 @@ Start-Service NgrokTunnel
 # 4. Let the gateway health monitor watch the tunnel service
 $envFile = Join-Path $project '.env'
 if (Test-Path $envFile) {
-    $lines = @(Get-Content $envFile | Where-Object { $_ -notmatch '^WATCH_SERVICES=' })
+    # .env is gitignored: the public domain stays out of the repo.
+    $lines = @(Get-Content $envFile | Where-Object { $_ -notmatch '^(WATCH_SERVICES|PUBLIC_BASE_URL)=' })
     $lines += 'WATCH_SERVICES=OllamaServe,NgrokTunnel'
+    $lines += "PUBLIC_BASE_URL=https://$Domain/v1"
     Set-Content -Path $envFile -Value $lines -Encoding ASCII
     if (Get-Service OllamaGateway -ErrorAction SilentlyContinue) { Restart-Service OllamaGateway }
 }
