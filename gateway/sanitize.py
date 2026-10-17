@@ -14,9 +14,13 @@ from .errors import APIError
 
 _COMMON = {"model", "stream", "stream_options", "max_tokens", "temperature", "top_p", "stop",
            "seed", "presence_penalty", "frequency_penalty", "user"}
-CHAT_FIELDS = _COMMON | {"messages", "response_format", "tools", "tool_choice"}
+CHAT_FIELDS = _COMMON | {"messages", "response_format", "tools", "tool_choice", "reasoning_effort"}
 COMPLETION_FIELDS = _COMMON | {"prompt"}
 EMBEDDING_FIELDS = {"model", "input", "encoding_format", "dimensions", "user"}
+# Ollama accepts any string here and keeps thinking on unknown values, so validate ourselves.
+# "low" is excluded on purpose: on qwen3.5:4b (Ollama 0.40.5) it thought until max_tokens and
+# returned empty content on every test prompt.
+REASONING_EFFORTS = {"none", "medium", "high"}
 
 ROLES = {"system", "developer", "user", "assistant", "tool"}
 NUMERIC = ("temperature", "top_p", "presence_penalty", "frequency_penalty")
@@ -144,13 +148,29 @@ def sanitize_chat(body: dict[str, Any], caps: set[str], settings: Settings) -> t
         raise bad(f"Model `{body['model']}` does not support tools.", param="tools")
     if body.get("response_format") is not None and not isinstance(body["response_format"], dict):
         raise bad("response_format must be an object.", param="response_format")
+    effort = body.get("reasoning_effort")
+    if effort is not None and effort not in REASONING_EFFORTS:
+        raise bad(f"reasoning_effort must be one of: {', '.join(sorted(REASONING_EFFORTS))}.",
+                  param="reasoning_effort")
 
-    return _common(body, CHAT_FIELDS, settings)
+    payload, include_usage = _common(body, CHAT_FIELDS, settings)
+    if "thinking" in caps:
+        # Thinking models (e.g. qwen3.5) think by default and can spend the whole max_tokens
+        # budget before answering: apply the server default unless the client chose.
+        if settings.default_reasoning_effort:
+            payload.setdefault("reasoning_effort", settings.default_reasoning_effort)
+    else:
+        payload.pop("reasoning_effort", None)
+    return payload, include_usage
 
 
 def sanitize_completion(body: dict[str, Any], caps: set[str], settings: Settings) -> tuple[dict[str, Any], bool]:
     if "completion" not in caps:
         raise bad(f"Model `{body['model']}` does not support completions.", param="model")
+    if "thinking" in caps:
+        # Ollama's /v1/completions returns empty text for thinking models (verified on 0.40.5).
+        raise bad(f"Model `{body['model']}` is a reasoning model; use /v1/chat/completions instead.",
+                  param="model", code="model_not_supported")
     if not isinstance(body.get("prompt"), str) or not body["prompt"]:
         raise bad("prompt must be a non-empty string.", param="prompt")
     return _common(body, COMPLETION_FIELDS, settings)
