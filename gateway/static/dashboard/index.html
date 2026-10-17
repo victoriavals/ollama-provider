@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kontrol Ollama Provider</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/admin/ui/app.css">
+  <script type="module" src="/admin/ui/app.js"></script>
+</head>
+<body>
+  <!-- Login: the admin key lives only in this tab's sessionStorage -->
+  <main id="login" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="off">
+      <h1>Kontrol Ollama Provider</h1>
+      <p class="muted">Dashboard ini hanya bisa dibuka dari komputer server.</p>
+      <label for="admin-key">Admin key</label>
+      <input id="admin-key" type="password" required spellcheck="false" placeholder="adm-...">
+      <p class="hint">Ada di file <code>.env</code> baris <code>ADMIN_KEY</code>. Tampilkan dengan:<br>
+        <code>Select-String '^ADMIN_KEY=' D:\ML\ollama-provider\.env</code></p>
+      <p id="login-error" class="error" role="alert" hidden></p>
+      <button type="submit" class="btn primary">Masuk</button>
+    </form>
+  </main>
+
+  <div id="app" class="shell" hidden>
+    <header class="topbar">
+      <div class="brand">Ollama Provider</div>
+      <ul id="lamps" class="lamps" aria-label="Status dependency"></ul>
+      <div id="slots" class="slots" aria-live="polite"></div>
+      <button id="logout" class="btn ghost" type="button">Keluar</button>
+    </header>
+
+    <nav class="sidebar" aria-label="Menu">
+      <button type="button" class="nav" data-view="overview" aria-current="page">Ringkasan</button>
+      <button type="button" class="nav" data-view="keys">API key</button>
+      <button type="button" class="nav" data-view="usage">Pemakaian</button>
+      <button type="button" class="nav" data-view="requests">Request</button>
+      <button type="button" class="nav" data-view="models">Model</button>
+    </nav>
+
+    <main class="content">
+      <!-- Ringkasan -->
+      <section id="view-overview" class="view" aria-labelledby="h-overview">
+        <h2 id="h-overview">Ringkasan</h2>
+        <div class="grid-2">
+          <section class="panel">
+            <h3>Hari ini</h3>
+            <dl id="today" class="stats"></dl>
+          </section>
+          <section class="panel">
+            <h3>Cara akses</h3>
+            <div id="access"></div>
+          </section>
+        </div>
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Request per jam, 24 jam terakhir</h3>
+            <span id="chart-total" class="muted"></span>
+          </div>
+          <div id="hourly" class="chart"></div>
+        </section>
+        <section class="panel">
+          <h3>Dependency</h3>
+          <table class="table" id="components">
+            <thead><tr><th scope="col">Komponen</th><th scope="col">Status</th><th scope="col">Detail</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- API key -->
+      <section id="view-keys" class="view" aria-labelledby="h-keys" hidden>
+        <h2 id="h-keys">API key</h2>
+        <section class="panel">
+          <h3>Buat key baru</h3>
+          <form id="key-form" class="form-row">
+            <div class="field grow">
+              <label for="key-name">Nama client</label>
+              <input id="key-name" required maxlength="100" placeholder="mis. aplikasi-chat">
+            </div>
+            <div class="field">
+              <label for="key-rpm">Batas / menit</label>
+              <input id="key-rpm" type="number" min="1" max="100000" inputmode="numeric">
+            </div>
+            <div class="field">
+              <label for="key-conc">Request paralel</label>
+              <input id="key-conc" type="number" min="1" max="64" inputmode="numeric">
+            </div>
+            <button type="submit" class="btn primary">Buat key</button>
+          </form>
+          <p class="hint" id="key-defaults"></p>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Daftar key</h3>
+            <label class="check"><input type="checkbox" id="show-revoked"> Tampilkan yang dicabut</label>
+          </div>
+          <div class="table-wrap">
+            <table class="table" id="keys-table">
+              <thead><tr>
+                <th scope="col">Nama</th><th scope="col">Prefix</th><th scope="col" class="num">Batas / menit</th>
+                <th scope="col" class="num">Paralel</th><th scope="col">Terakhir dipakai</th><th scope="col">Status</th>
+                <th scope="col"><span class="sr-only">Aksi</span></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <!-- Pemakaian -->
+      <section id="view-usage" class="view" aria-labelledby="h-usage" hidden>
+        <h2 id="h-usage">Pemakaian</h2>
+        <div class="filters" role="group" aria-label="Filter pemakaian">
+          <div class="segmented" id="usage-range">
+            <button type="button" data-range="1" aria-pressed="false">24 jam</button>
+            <button type="button" data-range="7" aria-pressed="true">7 hari</button>
+            <button type="button" data-range="30" aria-pressed="false">30 hari</button>
+          </div>
+          <div class="segmented" id="usage-group">
+            <button type="button" data-group="key" aria-pressed="true">Per key</button>
+            <button type="button" data-group="model" aria-pressed="false">Per model</button>
+            <button type="button" data-group="day" aria-pressed="false">Per hari</button>
+          </div>
+        </div>
+        <section class="panel">
+          <div id="usage-chart" class="hbars"></div>
+          <div class="table-wrap">
+            <table class="table" id="usage-table">
+              <thead><tr>
+                <th scope="col" id="usage-col">Key</th><th scope="col" class="num">Request</th><th scope="col" class="num">Error</th>
+                <th scope="col" class="num">Token prompt</th><th scope="col" class="num">Token jawaban</th>
+                <th scope="col" class="num">Rata-rata latensi</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <!-- Request -->
+      <section id="view-requests" class="view" aria-labelledby="h-requests" hidden>
+        <h2 id="h-requests">Request terbaru</h2>
+        <div class="filters">
+          <label class="check"><input type="checkbox" id="only-errors"> Hanya yang gagal</label>
+          <span class="muted">Diperbarui otomatis tiap 10 detik</span>
+        </div>
+        <section class="panel">
+          <div class="table-wrap">
+            <table class="table" id="requests-table">
+              <thead><tr>
+                <th scope="col">Waktu</th><th scope="col">Key</th><th scope="col">Endpoint</th><th scope="col">Model</th>
+                <th scope="col">Status</th><th scope="col" class="num">Token</th><th scope="col" class="num">Latensi</th>
+                <th scope="col">IP</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <!-- Model -->
+      <section id="view-models" class="view" aria-labelledby="h-models" hidden>
+        <h2 id="h-models">Model</h2>
+        <section class="panel">
+          <h3>Unduh model</h3>
+          <form id="pull-form" class="form-row">
+            <div class="field grow">
+              <label for="pull-name">Nama model Ollama</label>
+              <input id="pull-name" required maxlength="200" placeholder="mis. qwen3:8b" spellcheck="false">
+            </div>
+            <label class="check"><input type="checkbox" id="pull-enable"> Langsung aktifkan</label>
+            <button type="submit" class="btn primary">Unduh model</button>
+          </form>
+          <p class="hint">Hanya satu model yang dimuat di VRAM (8 GB). Beralih model membuat request pertama lebih lambat.</p>
+          <ul id="pull-jobs" class="jobs"></ul>
+        </section>
+        <section class="panel">
+          <h3>Model di server</h3>
+          <div class="table-wrap">
+            <table class="table" id="models-table">
+              <thead><tr>
+                <th scope="col">Model</th><th scope="col">Dipakai client</th><th scope="col" class="num">Ukuran</th>
+                <th scope="col">Parameter</th><th scope="col">Kuantisasi</th><th scope="col"><span class="sr-only">Aksi</span></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="dialog">
+    <form method="dialog" id="dialog-form">
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-body"></div>
+      <div class="dialog-actions" id="dialog-actions"></div>
+    </form>
+  </dialog>
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
