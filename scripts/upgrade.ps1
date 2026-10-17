@@ -26,13 +26,28 @@ if ($Component -in 'all', 'ollama') {
 
     Stop-ServiceSafe OllamaGateway
     Stop-ServiceSafe OllamaServe
+    # Keep the current version as bin.previous and extract into a clean bin (no stale CUDA
+    # runners); roll back automatically if the new version does not come up.
     $bin = Join-Path $Root 'bin'
-    if (Test-Path (Join-Path $bin 'lib')) { Remove-Item -Recurse -Force (Join-Path $bin 'lib') }
-    Expand-Archive -Path $zip -DestinationPath $bin -Force
-    Remove-Item $zip -Force
-
-    Start-Service OllamaServe
-    if (-not (Wait-Http 'http://127.0.0.1:11434/api/version' 60)) { throw 'OllamaServe did not come back.' }
+    $previous = Join-Path $Root 'bin.previous'
+    if (Test-Path $previous) { Remove-Item -Recurse -Force $previous }
+    Rename-Item $bin $previous
+    Write-Step "Previous version kept in $previous"
+    try {
+        Expand-Archive -Path $zip -DestinationPath $bin -Force
+        Start-Service OllamaServe
+        if (-not (Wait-Http 'http://127.0.0.1:11434/api/version' 60)) { throw 'OllamaServe did not answer after the upgrade.' }
+    } catch {
+        Write-Warning "Upgrade failed: $($_.Exception.Message). Rolling back to $before."
+        Stop-ServiceSafe OllamaServe
+        if (Test-Path $bin) { Remove-Item -Recurse -Force $bin }
+        Rename-Item $previous $bin
+        Start-Service OllamaServe
+        if (Get-Service OllamaGateway -ErrorAction SilentlyContinue) { Start-Service OllamaGateway }
+        throw
+    } finally {
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    }
     if (Get-Service OllamaGateway -ErrorAction SilentlyContinue) { Start-Service OllamaGateway }
     $after = (Invoke-RestMethod 'http://127.0.0.1:11434/api/version').version
     Write-Host "    Ollama $before -> $after"
