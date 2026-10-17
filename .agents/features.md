@@ -9,8 +9,9 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Chat completions (stream & non-stream) | Completed (diuji live) |
 | Text completions | Completed (diuji live) |
 | Embeddings | Completed (belum ada model embedding terpasang) |
+| Model kedua `qwen3.5:4b` + kontrol mode berpikir | Completed (diuji live 2026-10-17) |
 | Daftar model `/v1/models` | Completed (diuji live) |
-| Input gambar (vision) | Completed (unit test saja) |
+| Input gambar (vision) | Completed (diuji live 2026-10-17: gemma3 & qwen3.5 lewat URL publik) |
 | Tools / function calling passthrough | Completed (kondisional, belum bisa diuji: gemma3 tanpa `tools`) |
 | API key auth | Completed (diuji live) |
 | Rate limit per key (RPM) | Completed (diuji live) |
@@ -31,10 +32,10 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Deploy Windows Service (Ollama + gateway) | Completed (terpasang & diuji) |
 | Script status `status.ps1` | Completed (diuji live) |
 | Dashboard admin web (lokal) | Completed (diuji live + screenshot desktop/ponsel/gelap) |
-| Script upgrade | Completed (belum pernah dijalankan) |
+| Script upgrade | Completed (dipakai 2026-10-17: Ollama 0.34.4 → 0.40.5) |
 | Script uninstall | Completed (belum pernah dijalankan) |
 | Tunnel gratis ngrok | Completed (terpasang & diuji live 2026-10-16) |
-| Cloudflare Tunnel | In Progress (script siap, domain belum ada; alternatif dari ngrok) |
+| Cloudflare Tunnel | Tidak dipakai: script siap sebagai alternatif berbayar (pemilik memilih ngrok gratis) |
 | Retensi usage (prune) | Completed |
 | Lihat [Planned](#planned) | Planned |
 
@@ -68,6 +69,20 @@ Dependencies: Ollama `/v1/completions`
 
 Notes: `prompt` berupa array ditolak (400). Fixture stream (`tests/fixtures/completions_stream.txt`) memperlihatkan keanehan Ollama: `usage` bernilai 0 di setiap chunk.
 
+## Model Kedua qwen3.5:4b dan Kontrol Mode Berpikir
+
+Purpose: Menyediakan model dengan tools/function calling dan output terstruktur di samping `gemma3:4b`, tanpa jawaban kosong akibat mode berpikir.
+
+Status: Completed (2026-10-17). Diuji live lewat URL publik dengan SDK OpenAI: chat, stream (TTFT 0,13 dtk), gambar, tools (`cek_cuaca(kota="Bandung")`), 4 paralel, perpindahan model (~4 dtk), penolakan `/v1/completions` dan `reasoning_effort` tidak valid.
+
+Location: `gateway/sanitize.py` (`REASONING_EFFORTS`, `sanitize_chat`, `sanitize_completion`), `gateway/config.py` (`default_reasoning_effort`)
+
+Important Files: `sanitize.py`, `tests/test_sanitize.py`, `tests/fixtures/chat_stream_ollama040.txt`
+
+Dependencies: Ollama ≥ 0.40.5 (format OpenAI-compat dengan field `reasoning`), capability `thinking` dari `/api/show`
+
+Notes: Hasil uji perbandingan (10 prompt Indonesia): gemma3:4b paling natural; qwen3.5:4b unggul di tools/format tapi lebih lemah di fakta & nuansa bahasa; qwen3.5:9b paling akurat tapi 87% GPU dan 2× lebih lambat, sehingga dihapus. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default).
+
 ## Embeddings
 
 Purpose: `POST /v1/embeddings` untuk RAG.
@@ -100,7 +115,7 @@ Notes: Dibaca dari DB, bukan dari Ollama. Tidak dihitung ke RPM.
 
 Purpose: Konten `image_url` di pesan chat untuk model ber-capability `vision`.
 
-Status: Completed (unit test `test_images_need_vision_and_are_capped`). Belum diuji live dengan gambar sungguhan.
+Status: Completed. Unit test `test_images_need_vision_and_are_capped` + `test_image_url_must_be_inline_base64`; diuji live 2026-10-17 dengan screenshot dashboard (base64) ke `gemma3:4b` dan `qwen3.5:4b` lewat URL publik.
 
 Location: `gateway/sanitize.py` (`sanitize_chat`)
 
@@ -352,7 +367,7 @@ Notes: Perubahan key berlaku di service ≤ 30 dtk. Aksi yang mengubah state ter
 
 Purpose: Ollama dan gateway berjalan saat boot tanpa login, restart otomatis saat crash.
 
-Status: Completed. Terpasang dan diuji: stop graceful < 1 dtk, kill → hidup lagi 5–7 dtk. **Belum diuji: reboot tanpa login.**
+Status: Completed. Terpasang dan diuji: stop graceful < 1 dtk, kill → hidup lagi 5–7 dtk. Reboot teruji 2026-10-17 23:06–23:09: Windows Update me-restart PC 3×, kelima service (sshd, Tailscale, OllamaServe, OllamaGateway, NgrokTunnel) start otomatis pukul 23:10:01; warm-up gemma3 39 dtk; URL publik pulih.
 
 Location: `scripts/install-ollama.ps1`, `scripts/install-gateway.ps1`, `scripts/common.ps1`
 
@@ -394,7 +409,7 @@ Notes: `-Watch <detik>` untuk refresh otomatis. Tidak butuh admin.
 
 Purpose: Upgrade Ollama dan cloudflared (pengganti auto-update tray app).
 
-Status: Completed, **belum pernah dijalankan**.
+Status: Completed. Dipakai 2026-10-17 untuk Ollama 0.34.4 → 0.40.5 (downtime ~1 menit, format OpenAI-compat tetap kompatibel; 0.40 hanya menambah field `timings` di chunk stream).
 
 Location: `scripts/upgrade.ps1`
 
@@ -402,7 +417,7 @@ Important Files: `upgrade.ps1`, `common.ps1`
 
 Dependencies: GitHub releases
 
-Notes: Menghentikan gateway lalu Ollama dengan `Stop-ServiceSafe`, mengganti `bin\lib`, lalu start dan cek GPU.
+Notes: Unduh dulu, lalu `Stop-ServiceSafe` gateway + Ollama (membersihkan runner yatim), rename `bin` → `bin.previous`, ekstrak ke `bin` bersih, start; jika gagal → rollback otomatis ke `bin.previous`. Cek GPU di akhir.
 
 ## Script Uninstall
 
@@ -436,7 +451,7 @@ Notes: Service `NgrokTunnel` menjalankan `ngrok start --all --config ... --log s
 
 Purpose: Eksposur publik via HTTPS tanpa port forwarding.
 
-Status: **In Progress**. Script siap. Menunggu domain di Cloudflare dan token tunnel dari pemilik.
+Status: Tidak dipakai (alternatif). Script siap dan lolos parse-check, tetapi pemilik tidak mau membeli domain; jalur publik memakai ngrok. Pakai script ini hanya bila nanti ada domain di Cloudflare (lalu hapus `NgrokTunnel`, pilih satu tunnel saja).
 
 Location: `scripts/install-cloudflared.ps1`
 
@@ -450,13 +465,15 @@ Notes: Script menambahkan `--loglevel info --log-directory D:\ollama\logs\cloudf
 
 ## Planned
 
-Dari sesi desain 2026-09-27 (di luar scope v1, belum ada kode):
+Belum ada kode. Sumber: sesi desain 2026-09-27 dan permintaan pemilik sesudahnya. Detail siapa/kapan di [operations.md#pekerjaan-tertunda](operations.md#pekerjaan-tertunda).
 
 | Rencana | Catatan |
 |---|---|
 | Kuota token / billing per key | Baru ada RPM + konkurensi |
-| Dashboard web UI | Saat ini: `status.ps1`, admin API, file log |
-| Admin jarak jauh | Via hostname terpisah + Cloudflare Access (jangan membuka port 8001) |
-| Model embedding | Mis. `nomic-embed-text`; pertimbangkan `OLLAMA_MAX_LOADED_MODELS=2` agar tidak swap dengan model chat |
+| Admin jarak jauh tanpa SSH | Saat ini lewat SSH port forward. Alternatif: hostname terpisah + Cloudflare Access (jangan membuka port 8001 lewat ngrok) |
+| Model embedding | Kandidat `qwen3-embedding:0.6b` (0,64 GB, 100+ bahasa). Dengan `OLLAMA_MAX_LOADED_MODELS=1` setiap embedding mengusir model chat; evaluasi VRAM untuk `=2` |
 | Multi-node | Butuh state limit terpusat (tidak kompatibel dengan desain in-memory saat ini) |
-| Jadwal backup DB | `POST /admin/backup` sudah ada; belum ada scheduler |
+| Jadwal backup DB | `POST /admin/backup` sudah ada; pemilik menolak penjadwalan untuk saat ini |
+| Notifikasi Telegram | HealthMonitor → Telegram Bot API via `httpx` (tanpa dependency baru); token bot di `.env`. Menunggu keputusan pemilik |
+| Setting `PRIMARY_MODEL` | Diperlukan bila model utama bukan model aktif pertama secara alfabet (warm-up & contoh kode dashboard) |
+| Panduan client 1 halaman | Opsional |
