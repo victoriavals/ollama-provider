@@ -68,7 +68,7 @@ data/  logs/        runtime, gitignored, jangan di-commit
 4. Bandingkan admin key dengan `hmac.compare_digest`.
 5. Semua server bind `127.0.0.1`. Port 8001 (admin) dan 11434 (Ollama) tidak boleh dirouting tunnel. Jalur publik dibatasi oleh path regex Cloudflare `^/(v1|health)(/.*)?$`.
 6. Header IP client (`CLIENT_IP_HEADERS`, default `cf-connecting-ip,x-forwarded-for`) hanya dipercaya karena port 8000 cuma bisa dicapai proses lokal (agen tunnel). Untuk `X-Forwarded-For` dipakai entri **terakhir** (entri awal bisa dipalsukan client). IP di-resolve sekali di `RequestContextMiddleware` (`request.state.client_ip`). Jangan ubah bind ke `0.0.0.0`.
-7. Pertahankan **allowlist** di `sanitize.py`. Field Ollama (`options`, `keep_alive`, `num_ctx`, `think`) harus tetap dibuang. `max_tokens` di-cap. `n>1` ditolak. `tools` hanya lolos kalau model punya capability `tools`. `image_url` hanya boleh `data:image/...;base64,...`; URL `http(s)`/`file` ditolak (cegah SSRF).
+7. Pertahankan **allowlist** di `sanitize.py`. Field Ollama (`options`, `keep_alive`, `num_ctx`, `think`) harus tetap dibuang. `max_tokens` di-cap. `n>1` ditolak. `tools` hanya lolos kalau model punya capability `tools`. `image_url` hanya boleh `data:image/...;base64,...`; URL `http(s)`/`file` ditolak (cegah SSRF). `reasoning_effort` hanya untuk model ber-capability `thinking` (nilai `none`/`medium`/`high`), default dari `DEFAULT_REASONING_EFFORT`.
 8. Batas: body ≤ `MAX_BODY_BYTES` (dihitung saat stream masuk), gambar ≤ `MAX_IMAGES`, pesan ≤ `MAX_MESSAGES`, input embedding ≤ `MAX_EMBEDDING_INPUTS`, stop ≤ 4 × 100 karakter.
 9. Brute force: `FailedAuthLimiter` (20 gagal/menit per IP → 429). Docs OpenAPI publik dimatikan.
 10. File sensitif `.env` dan `data/` di-ACL (SID SYSTEM `S-1-5-18`, Administrators `S-1-5-32-544`, user installer). Di `icacls`, pakai SID, bukan nama (`WORKGROUP\user` gagal untuk akun lokal).
@@ -96,7 +96,7 @@ data/  logs/        runtime, gitignored, jangan di-commit
 
 ## Testing rules
 
-- `uv run pytest` harus hijau (saat ini 74 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
+- `uv run pytest` harus hijau (saat ini 79 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
 - Ollama selalu di-mock: fixture `ollama` (respx `MockRouter`) dipasang ke `Gateway(..., ollama_transport=httpx.MockTransport(router.async_handler))`.
 - Gunakan fixture: `gw`, `public`, `admin`, `api_key`, `auth`, helper `new_key()` dan `flush_usage()` (`tests/conftest.py`).
 - Setting test via `make_settings()`: `health_interval_s=0`, `watch_services=""`, `log_dir=tmp_path/"logs"`, `warmup=False`. Test tidak boleh menyentuh service, GPU, atau jaringan sungguhan (kecuali `test_service_states_on_windows`, yang di-skip di non-Windows).
