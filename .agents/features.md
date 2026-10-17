@@ -30,9 +30,10 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | CLI manajemen | Completed (diuji live) |
 | Deploy Windows Service (Ollama + gateway) | Completed (terpasang & diuji) |
 | Script status `status.ps1` | Completed (diuji live) |
+| Dashboard admin web (lokal) | Completed (diuji live + screenshot desktop/ponsel/gelap) |
 | Script upgrade | Completed (belum pernah dijalankan) |
 | Script uninstall | Completed (belum pernah dijalankan) |
-| Tunnel gratis ngrok | In Progress (script siap, menunggu authtoken + domain) |
+| Tunnel gratis ngrok | Completed (terpasang & diuji live 2026-10-16) |
 | Cloudflare Tunnel | In Progress (script siap, domain belum ada; alternatif dari ngrok) |
 | Retensi usage (prune) | Completed |
 | Lihat [Planned](#planned) | Planned |
@@ -361,6 +362,20 @@ Dependencies: WinSW v2.12.0, zip Ollama dari GitHub releases, Python di `C:\Prog
 
 Notes: Lihat [decisions.md #13](decisions.md#13-winsw-menggantikan-nssm) dan [#14](decisions.md#14-service-gateway-memakai-base-python--pythonpath).
 
+## Dashboard Admin Web
+
+Purpose: Mengontrol provider dari browser di PC server: status dependency + meter slot GPU, ringkasan hari ini, grafik request per jam, cara akses client, kelola API key, pemakaian, request terbaru, kelola model.
+
+Status: Completed (2026-10-16). Diuji: 74 test, screenshot Edge headless (desktop terang/gelap, ponsel 390px, tanpa overflow, console bersih).
+
+Location: `gateway/static/dashboard/` (`index.html`, `app.css`, `app.js`), route `GET /admin/ui` di `gateway/apps/admin.py`
+
+Important Files: `app.js` (vanilla JS, DOM via `h()`/`textContent`, tanpa `innerHTML`), `apps/admin.py` (`UI_HEADERS`, `TrustedHostMiddleware`, `/admin/info`)
+
+Dependencies: Admin API, `ADMIN_KEY`, `PUBLIC_BASE_URL` (opsional, di `.env`), `ADMIN_ALLOWED_HOSTS`
+
+Notes: Hanya di port 8001 (loopback). CSP `script-src 'self'` tanpa CDN/inline, `frame-ancestors 'none'`, `no-store`. Admin key di `sessionStorage`. Host header selain `127.0.0.1`/`localhost` → 400 (anti DNS rebinding). `group_by=hour` ditambahkan ke `/admin/usage` untuk grafik.
+
 ## Script Status
 
 Purpose: Ringkasan pemantauan di terminal.
@@ -407,7 +422,7 @@ Notes: `-IncludeCloudflared` untuk ikut menghapus tunnel.
 
 Purpose: Eksposur publik HTTPS gratis dengan URL tetap (domain statis `*.ngrok-free.app`), tanpa membeli domain.
 
-Status: **In Progress**. Script siap dan lolos parse-check. Belum dijalankan karena menunggu authtoken dan domain statis dari akun ngrok pemilik.
+Status: Completed. Terpasang 2026-10-16 dan diuji dari publik: `/health` ok, tanpa key → 401, `/admin` & `/api` → 404, non-stream 1.6 dtk, stream TTFB 0.13 dtk sampai `[DONE]`, IP client asli tercatat dari `X-Forwarded-For`, inspector 4040 mati.
 
 Location: `scripts/install-ngrok.ps1`
 
