@@ -51,6 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_key_ts ON usage_logs(key_id, ts);
 
 KEY_COLUMNS = "id, name, prefix, rpm_limit, max_concurrent, created_at, last_used_at, revoked_at"
 GROUP_BY = {
+    "hour": "substr(u.ts, 1, 13)",
     "day": "substr(u.ts, 1, 10)",
     "key": "u.key_id",
     "model": "u.model",
