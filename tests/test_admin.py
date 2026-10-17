@@ -3,6 +3,7 @@ import json
 
 import httpx
 
+from gateway.apps.admin import create_admin_app
 from tests.conftest import ADMIN_KEY, fixture_json
 
 
@@ -125,3 +126,40 @@ async def test_status(admin, ollama):
     ollama.get("/api/version").mock(side_effect=httpx.ConnectError("down"))
     body = (await admin.get("/admin/status")).json()
     assert body["ollama"]["reachable"] is False
+
+
+async def test_dashboard_is_served_with_strict_headers(admin):
+    r = await admin.get("/admin/ui", headers={"Authorization": ""})
+    assert r.status_code == 200 and "Kontrol Ollama Provider" in r.text
+    csp = r.headers["content-security-policy"]
+    assert "script-src 'self'" in csp and "frame-ancestors 'none'" in csp and "unsafe-inline" not in csp
+    assert r.headers["x-frame-options"] == "DENY" and r.headers["cache-control"] == "no-store"
+    js = await admin.get("/admin/ui/app.js")
+    assert js.status_code == 200 and js.headers["content-type"].startswith("text/javascript")
+    assert ".innerHTML" not in js.text and "insertAdjacentHTML" not in js.text  # text via textContent only
+    assert (await admin.get("/admin/ui/../../.env")).status_code == 404
+    assert (await admin.get("/admin/ui/index.html")).status_code == 404
+    assert (await admin.get("/", follow_redirects=False)).headers["location"] == "/admin/ui"
+
+
+async def test_admin_rejects_foreign_host_header(gw):
+    # DNS rebinding: a web page on evil.example resolving to 127.0.0.1 must not reach the admin app.
+    transport = httpx.ASGITransport(app=create_admin_app(gw))
+    async with httpx.AsyncClient(transport=transport, base_url="http://evil.example:8001") as client:
+        assert (await client.get("/admin/ui")).status_code == 400
+        assert (await client.get("/admin/keys", headers={"Authorization": f"Bearer {ADMIN_KEY}"})).status_code == 400
+
+
+async def test_info_and_hourly_usage(admin, public, auth, gw, ollama):
+    gw.settings.public_base_url = "https://example.test/v1"
+    info = (await admin.get("/admin/info")).json()
+    assert info["public_base_url"] == "https://example.test/v1"
+    assert info["defaults"]["rpm"] == 100 and "gemma3:4b" in info["models"]
+
+    ollama.post("/v1/chat/completions").respond(json=fixture_json("chat.json"))
+    await public.post("/v1/chat/completions", headers=auth,
+                      json={"model": "gemma3:4b", "messages": [{"role": "user", "content": "hi"}]})
+    await gw.usage.stop()
+    gw.usage.start()
+    [row] = (await admin.get("/admin/usage", params={"group_by": "hour"})).json()["data"]
+    assert len(row["hour"]) == 13 and row["requests"] == 1
