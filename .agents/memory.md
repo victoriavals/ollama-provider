@@ -1,7 +1,8 @@
 # Project Memory: ollama-provider
 
 > **Baca file ini sebelum mengubah apa pun.** Ini ringkasan tertinggi. Detail ada di file lain di `.agents/` (lihat [Dokumentasi lain](#dokumentasi-lain)).
-> Terakhir diperbarui: 2026-09-27. Semua isi berasal dari kode di repository, kecuali bagian yang ditandai *(observasi mesin)*.
+> Terakhir diperbarui: 2026-10-18. Semua isi berasal dari kode di repository, kecuali bagian yang ditandai *(observasi mesin)*. Kondisi mesin, prosedur operasional, dan konteks pemilik ada di [operations.md](operations.md).
+> **Repo ini publik di GitHub:** jangan menulis rahasia, domain ngrok, IP, atau token di `.agents/`.
 
 ## Ringkasan project
 
@@ -9,41 +10,44 @@
 |---|---|
 | Nama | `ollama-provider` (`pyproject.toml`) |
 | Tujuan | Menyajikan model Ollama lokal sebagai **API OpenAI-compatible** yang bisa diakses dari internet, dengan API key per client, rate limit, usage log, admin API, dan log pemantauan |
-| Jenis | Backend API gateway / reverse proxy (tanpa frontend) |
+| Jenis | Backend API gateway / reverse proxy + dashboard admin web lokal (`/admin/ui`, statis, vanilla JS) |
 | Target pengguna | Aplikasi client yang memakai SDK OpenAI, LangChain, atau curl (README). Identitas pengguna akhir: *Unknown - information not available in repository* |
 | Bahasa | Python 3.11 (gateway), PowerShell 5.1 (script deploy) |
 | Framework | FastAPI 0.141 / Starlette 1.7, uvicorn 0.54, httpx 0.28, pydantic-settings 2.15 |
 | Database | SQLite (via aiosqlite 0.22), file `data/gateway.db` |
 | Upstream | Ollama (`http://127.0.0.1:11434`), memakai endpoint OpenAI-compat `/v1/*` dan native `/api/*` |
-| Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Windows Service via **WinSW v2.12**, Cloudflare Tunnel |
+| Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Ollama 0.40.5, Windows Service via **WinSW v2.12**, tunnel publik **ngrok** (gratis, aktif). Cloudflare Tunnel tersedia sebagai alternatif berbayar |
 | Package manager | `uv` (`uv.lock`) |
-| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **74 test** |
+| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **79 test** |
 | Bahasa dokumentasi | Indonesia (README, `.agents/`), komentar kode dalam Bahasa Inggris |
 
 ## Arsitektur singkat
 
 ```
-Client --HTTPS--> Cloudflare edge --> cloudflared [service Cloudflared]
-  --> 127.0.0.1:8000  app publik  (/v1/*, /health)   } satu proses Python, dua uvicorn.Server
-      127.0.0.1:8001  app admin   (/admin/*)         } [service OllamaGateway]
-  --> 127.0.0.1:11434 ollama serve [service OllamaServe]
+Client --HTTPS--> ngrok edge --> ngrok agent [service NgrokTunnel]
+  --> 127.0.0.1:8000  app publik  (/v1/*, /health)            } satu proses Python, dua uvicorn.Server
+      127.0.0.1:8001  app admin   (/admin/*, dashboard /admin/ui) } [service OllamaGateway, LocalService]
+  --> 127.0.0.1:11434 ollama serve [service OllamaServe] -> gemma3:4b | qwen3.5:4b (satu dimuat)
+Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 ```
 
 - Kedua app berbagi satu objek `Gateway` (`gateway/core.py`): DB, client Ollama, rate limiter, gate konkurensi GPU, cache key, pull manager, dan health monitor.
 - Port 8001 dan 11434 **tidak pernah** diekspos lewat tunnel.
 - Detail lengkap: [architecture.md](architecture.md).
 
-## Status deployment *(observasi mesin, 2026-09-27)*
+## Status deployment *(observasi mesin, 2026-10-18)*
 
 | Komponen | Status |
 |---|---|
-| `OllamaServe` (Ollama 0.34.4, `D:\ollama\bin`, model di `D:\ollama\models`) | Terpasang, Running, Automatic |
+| `OllamaServe` (Ollama 0.40.5 sejak 2026-10-17, `D:\ollama\bin`, versi sebelumnya di `D:\ollama\bin.previous`, model di `D:\ollama\models`) | Terpasang, Running, Automatic |
 | `OllamaGateway` | Terpasang, Running, Automatic |
 | `NgrokTunnel` | Terpasang 2026-10-16, Running, Automatic. Domain statis gratis (`*.ngrok-free.dev`) ada di `D:\ollama\ngrok\ngrok.yml`; **sengaja tidak ditulis di repo publik** |
 | `Cloudflared` | **Belum terpasang**. Alternatif berbayar (butuh domain); script tetap tersedia |
-| Model | `gemma3:4b` saja (100% GPU, context 8192) |
+| Model | `gemma3:4b` (utama, dimuat saat start) + `qwen3.5:4b` (tools/JSON, sejak 2026-10-17). Masing-masing 100% GPU; hanya satu dimuat sekaligus (`OLLAMA_MAX_LOADED_MODELS=1`). `qwen3.5:9b` diuji lalu dihapus (87% GPU, 41 tok/dtk) |
 | Git | Branch `main`, remote publik `github.com/victoriavals/ollama-provider`. Agent Codex juga bekerja di repo ini: cek `.git/*.lock` dan proses `codex` sebelum operasi git |
 | Tray app Ollama (milik user Windows "User") | Autostart dimatikan (`Ollama.lnk` → `Ollama.lnk.disabled`), tidak di-uninstall |
+| API key client | 1 key aktif (milik pemilik, dipakai dari luar lewat ngrok); key lain adalah key uji yang sudah dicabut |
+| Reboot | Teruji 2026-10-17: Windows Update me-restart PC, semua service pulih otomatis tanpa login |
 
 ## Pengetahuan kritis (jebakan yang pernah terjadi)
 
@@ -63,6 +67,8 @@ Client --HTTPS--> Cloudflare edge --> cloudflared [service Cloudflared]
 14. **Folder repo dimiliki user Windows "User"**, sedangkan shell berjalan sebagai "dev". Git butuh `safe.directory` (sudah ditambahkan di config global user dev).
 15. **Pengelompokan usage per hari memakai tanggal UTC** (`substr(ts,1,10)`), sedangkan log file memakai waktu lokal (WIB, +07:00).
 16. **Jangan `Stop-Process` langsung pada `ollama.exe`.** Runner anaknya (`llama-server.exe`) tertinggal sebagai proses yatim dan tetap memegang VRAM (pernah 2 runner yatim memakan ~2.2 GB). Hentikan lewat service (`Stop-ServiceSafe OllamaServe`, yang otomatis memanggil `Remove-OrphanOllamaRunners`).
+17. **Model berpikir (qwen3.5) berpikir secara default** dan bisa menghabiskan seluruh `max_tokens` sebelum menjawab (7/10 jawaban kosong di uji). Gateway menyuntik `reasoning_effort` = `DEFAULT_REASONING_EFFORT` (default `none`) untuk model ber-capability `thinking`; nilai client divalidasi (`none`/`medium`/`high`; `low` ditolak karena selalu macet sampai batas token). `/v1/completions` ditolak untuk model berpikir (Ollama mengembalikan teks kosong). Warm-up memilih model aktif pertama secara alfabet (= `gemma3:4b`).
+18. **Akses SSH pemilik lewat Tailscale bergantung pada login user "User".** Profil Tailscale terikat ke akun "User" dan *Run unattended* (ForceDaemon) tidak aktif; `AutoAdminLogon=0`. Setelah restart oleh Windows Update, "User" otomatis login (kemungkinan fitur sign-in otomatis pasca-update) sehingga Tailscale tersambung. Restart manual tidak menjamin itu, jadi bisa memutus SSH pemilik dari jauh. Jangan me-restart PC dari jauh sebelum *Run unattended* diaktifkan dari akun "User". Service API (ngrok) tetap pulih tanpa login.
 
 ## Aturan wajib untuk AI Agent
 
@@ -97,7 +103,12 @@ Aturan operasional tambahan:
 | `gateway/logs.py` | Log file harian | Tanpa rename (aman di-tail di Windows) |
 | `gateway/db.py` | Schema, query, `UsageWriter` | Satu-satunya tempat SQL |
 | `gateway/config.py` | Semua setting (env / `.env`) | |
-| `scripts/common.ps1` | Helper deploy (WinSW, Stop-ServiceSafe, download) | Dipakai semua script |
+| `gateway/static/dashboard/` | Dashboard admin (`index.html`, `app.css`, `app.js`) | Tanpa `innerHTML`/CDN; CSP ketat dari `apps/admin.py` |
+| `scripts/common.ps1` | Helper deploy (WinSW, `Stop-ServiceSafe`, `Remove-OrphanOllamaRunners`, `Protect-AdminOnlyTree`, download) | Dipakai semua script |
+| `scripts/install-ngrok.ps1` | Pasang tunnel aktif (service `NgrokTunnel`) | Mengisi `WATCH_SERVICES` + `PUBLIC_BASE_URL` di `.env` |
+| `scripts/upgrade.ps1` | Upgrade Ollama/ngrok/cloudflared | Ollama: backup `bin.previous` + rollback otomatis |
+| `scripts/status.ps1` | Ringkasan operasional satu layar | Tidak butuh admin |
+| `D:\ollama\ngrok\ngrok.yml` | Config ngrok berisi authtoken + domain (di luar repo) | **Sensitif**, ber-ACL protected |
 | `.env` | Secret (`ADMIN_KEY`) + konfigurasi | **Sensitif**, gitignored, ber-ACL |
 | `data/gateway.db` | Hash API key + usage | **Sensitif**, gitignored |
 | `D:\ollama\services\*.xml` | Definisi service WinSW (dibuat script, di luar repo) | Jangan diedit manual; jalankan ulang script install |
@@ -121,5 +132,6 @@ Aturan operasional tambahan:
 | [decisions.md](decisions.md) | Technical Decision Records |
 | [commands.md](commands.md) | Perintah install, dev, test, DB, deploy, debugging |
 | [features.md](features.md) | Daftar fitur beserta status dan lokasi |
+| [operations.md](operations.md) | Kondisi mesin & VRAM, akses jarak jauh, runbook operasional, insiden, konteks & preferensi pemilik, pekerjaan tertunda, riwayat perubahan |
 | `../README.md` | Panduan pengguna/operator (Indonesia) |
 | `../CLAUDE.md` | Dimuat otomatis oleh Claude Code; mengimpor file ini lewat `@.agents/memory.md` dan menunjuk ke dokumen di atas |
