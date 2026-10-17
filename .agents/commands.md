@@ -26,14 +26,17 @@ powershell -ExecutionPolicy Bypass -File scripts\install-ollama.ps1
 powershell -ExecutionPolicy Bypass -File scripts\install-gateway.ps1
 #    parameter: -Root D:\ollama -Python "C:\Program Files\Python311\python.exe"
 
-# 3. Cloudflare Tunnel (butuh token dari Zero Trust > Networks > Tunnels)
-powershell -ExecutionPolicy Bypass -File scripts\install-cloudflared.ps1 -Token <TOKEN>
+# 3a. Tunnel AKTIF: ngrok (gratis, domain statis *.ngrok-free.dev) -> service NgrokTunnel (WinSW)
+#     Juga mengisi WATCH_SERVICES dan PUBLIC_BASE_URL di .env, lalu restart gateway.
+powershell -ExecutionPolicy Bypass -File scripts\install-ngrok.ps1 -AuthToken <TOKEN> -Domain <domain-statis>
+#     parameter: -Root D:\ollama -SourceExe C:\ngrok\ngrok.exe
 
-# 3 (alternatif gratis, tanpa domain). Pilih SATU tunnel saja: ngrok -> service NgrokTunnel (WinSW)
-powershell -ExecutionPolicy Bypass -File scripts\install-ngrok.ps1 -AuthToken <TOKEN> -Domain <nama>.ngrok-free.app
-#    parameter: -Root D:\ollama -SourceExe C:\ngrok\ngrok.exe
-#    parameter: -Http2 (jika UDP 7844 diblokir) -LogRoot D:\ollama\logs
+# 3b. Alternatif berbayar (butuh domain di Cloudflare). Pilih SATU tunnel saja.
+powershell -ExecutionPolicy Bypass -File scripts\install-cloudflared.ps1 -Token <TOKEN>
+#     parameter: -Http2 (jika UDP 7844 diblokir) -LogRoot D:\ollama\logs
 ```
+
+Authtoken ngrok jangan ditempel di chat atau commit; script menyimpannya di `D:\ollama\ngrok\ngrok.yml` (ber-ACL). Domain publik hanya disimpan di `.env` (`PUBLIC_BASE_URL`), tidak di repo.
 
 Semua script idempoten: menjalankan ulang akan menghapus dan membuat ulang service.
 
@@ -58,7 +61,7 @@ curl.exe http://127.0.0.1:18000/v1/chat/completions -H "Authorization: Bearer sk
 ## Testing
 
 ```powershell
-uv run pytest                                    # semua test (74), Ollama di-mock, tanpa jaringan
+uv run pytest                                    # semua test (79), Ollama di-mock, tanpa jaringan
 uv run pytest tests/test_proxy.py -q             # satu file
 uv run pytest -k stream -q                       # filter nama test
 ```
@@ -117,16 +120,56 @@ Tidak ada build step. Python dijalankan langsung dari source (`python -m gateway
 
 | Tugas | Perintah |
 |---|---|
-| Status service | `Get-Service OllamaServe, OllamaGateway, Cloudflared` |
+| Status service | `Get-Service OllamaServe, OllamaGateway, NgrokTunnel, Cloudflared` |
 | Deploy perubahan kode gateway | `Restart-Service OllamaGateway` (service menjalankan source di folder project) |
 | Deploy perubahan dependency | `uv sync`, lalu `Restart-Service OllamaGateway` |
 | Ubah setting gateway | edit `.env`, lalu `Restart-Service OllamaGateway` |
 | Ubah env Ollama (`NUM_PARALLEL`, context) | `scripts\install-ollama.ps1 -SkipDownload -NumParallel 2 -ContextLength 8192`, lalu samakan `GLOBAL_CONCURRENCY` di `.env` dan restart gateway |
-| Restart Ollama | `Stop-Service OllamaGateway; Restart-Service OllamaServe; Start-Service OllamaGateway` |
-| Upgrade Ollama / ngrok / cloudflared | `scripts\upgrade.ps1 [-Component ollama\|ngrok\|cloudflared\|all]` |
+| Restart Ollama | `. .\scripts\common.ps1; Stop-ServiceSafe OllamaGateway; Stop-ServiceSafe OllamaServe; Start-Service OllamaServe, OllamaGateway` (jangan `Stop-Process ollama.exe`: runner yatim memegang VRAM) |
+| Upgrade Ollama / ngrok / cloudflared | `scripts\upgrade.ps1 [-Component ollama\|ngrok\|cloudflared\|all]` (Ollama: versi lama disimpan di `D:\ollama\bin.previous`, rollback otomatis bila gagal) |
+| Rollback Ollama manual | `Stop-ServiceSafe OllamaGateway; Stop-ServiceSafe OllamaServe; Rename-Item D:\ollama\bin bin.failed; Rename-Item D:\ollama\bin.previous bin; Start-Service OllamaServe, OllamaGateway` |
 | Hapus service | `scripts\uninstall-services.ps1 [-IncludeNgrok] [-IncludeCloudflared]` |
 | Kembalikan tray app | rename `C:\Users\User\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Ollama.lnk.disabled` → `Ollama.lnk` (setelah service dihapus) |
 | Host tidak sleep | `powercfg /change standby-timeout-ac 0; powercfg /change hibernate-timeout-ac 0` |
+
+## Akses jarak jauh (pemilik lewat SSH)
+
+Pemilik masuk dari jauh lewat **SSH di atas Tailscale**. Dashboard admin hanya mendengarkan `127.0.0.1:8001`, jadi diakses lewat port forwarding:
+
+```bash
+# di laptop pemilik (bukan di server); lalu buka http://127.0.0.1:8001/admin/ui
+ssh -N -L 8001:127.0.0.1:8001 dev@<alamat-tailscale-server>
+# VS Code Remote-SSH: panel Ports -> Forward a Port -> 8001
+```
+
+**Jangan me-restart PC dari jauh** sebelum Tailscale disetel *Run unattended* dari akun Windows "User". Tanpa itu, Tailscale (dan SSH pemilik) baru tersambung setelah "User" login. API tetap pulih karena berjalan sebagai service. Kalau terpaksa restart: `shutdown /r /t 120` (batalkan dengan `shutdown /a`), lalu cek dari luar lewat `https://<domain>/health`.
+
+## Model
+
+```powershell
+# lewat dashboard (menu Model) atau admin API:
+Invoke-RestMethod -Method Post http://127.0.0.1:8001/admin/models/pull -Headers $h -ContentType 'application/json' -Body '{"model":"qwen3.5:4b","enable":false}'
+Invoke-RestMethod http://127.0.0.1:8001/admin/models/pull -Headers $h                       # progres job
+Invoke-RestMethod -Method Patch 'http://127.0.0.1:8001/admin/models/qwen3.5:4b' -Headers $h -ContentType 'application/json' -Body '{"enabled":true}'
+Invoke-RestMethod -Method Delete 'http://127.0.0.1:8001/admin/models/qwen3.5:9b' -Headers $h
+curl.exe -s http://127.0.0.1:11434/api/show -d '{\"model\":\"qwen3.5:4b\"}'                # capabilities
+```
+
+- Cek muat 100% di GPU setelah menambah model: `curl.exe http://127.0.0.1:11434/api/ps` (`size_vram` harus sama dengan `size`).
+- Uji mode berpikir model baru: `reasoning_effort` `none`/`medium`/`high` lewat `/v1/chat/completions`, dengan `max_tokens` besar. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default).
+- Uji perbandingan model dijalankan dengan script sementara di scratchpad (bukan di repo). Metodenya: prompt Indonesia per model berurutan, `/api/chat` native untuk `eval_count`/`eval_duration`, uji beban 4 paralel, lalu warm-up `gemma3:4b` lagi.
+
+## Setelah PC restart
+
+Tidak ada langkah manual. Kelima service (sshd, Tailscale, OllamaServe, OllamaGateway, NgrokTunnel) start otomatis, dan warm-up memuat `gemma3:4b` (~40 dtk). Verifikasi:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\status.ps1
+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=1074} -MaxEvents 3 | Format-List TimeCreated, Message   # siapa yang me-restart
+```
+
+Yang **tidak** ikut menyala tanpa login "User": Docker Desktop (container MongoDB project lain), aplikasi desktop lain di sesi "User", dan Tailscale (bila belum *Run unattended*).
 
 ## Debugging
 
@@ -141,12 +184,17 @@ Select-String logs\health-*.log -Pattern 'down|warn|recovered'                  
 Get-Content logs\OllamaGateway.err.log -Tail 50                                           # crash gateway
 Get-Content D:\ollama\logs\OllamaServe.err.log -Tail 50                                   # log Ollama
 Get-Content logs\OllamaGateway.wrapper.log, D:\ollama\logs\OllamaServe.wrapper.log -Tail 20   # WinSW
-Get-Content D:\ollama\logs\cloudflared\cloudflared.log -Tail 50                           # tunnel (setelah terpasang)
+Get-Content D:\ollama\logs\ngrok\NgrokTunnel.out.log -Tail 50                             # tunnel ngrok (aktif)
+Get-Content D:\ollama\logs\cloudflared\cloudflared.log -Tail 50                           # tunnel cloudflared (bila dipasang)
 
 Invoke-RestMethod http://127.0.0.1:8001/admin/status -Headers $h | ConvertTo-Json -Depth 6  # health live
 curl.exe http://127.0.0.1:11434/api/ps                                                     # model dimuat + VRAM
 nvidia-smi
 sc.exe qfailure OllamaGateway                                                              # failure action
+Get-Process llama-server                                                                   # harus 1 (runner model aktif)
+. .\scripts\common.ps1; Remove-OrphanOllamaRunners                                         # bunuh runner yatim (induk mati)
+# VRAM per proses (nvidia-smi menampilkan N/A di mode WDDM):
+(Get-Counter '\GPU Process Memory(*)\Dedicated Usage').CounterSamples | ? CookedValue -gt 50MB | sort CookedValue -Desc | select InstanceName, @{n='MB';e={[int]($_.CookedValue/1MB)}}
 ```
 
 Masalah yang pernah terjadi:
@@ -160,3 +208,10 @@ Masalah yang pernah terjadi:
 | Klien menerima HTML dari Cloudflare | Bot Fight Mode / Browser Integrity Check masih aktif |
 | 524 dari Cloudflare | Request non-stream terlalu lama. Turunkan `MAX_TOKENS_CAP` atau pakai `stream: true` |
 | `git` menolak repo ("dubious ownership") | `git config --global --add safe.directory D:/ML/ollama-provider` |
+| VRAM penuh padahal hanya satu model | Runner `llama-server` yatim setelah `ollama.exe` di-kill paksa. Jalankan `Remove-OrphanOllamaRunners` |
+| Jawaban qwen kosong / `finish_reason: length` | Mode berpikir menghabiskan token. Pastikan `DEFAULT_REASONING_EFFORT=none`; client yang menyalakan berpikir perlu `max_tokens` besar |
+| `/v1/completions` ke qwen ditolak 400 | Disengaja: Ollama mengembalikan teks kosong untuk model berpikir. Pakai `/v1/chat/completions` |
+| Client browser menerima halaman peringatan ngrok | Paket gratis ngrok; client browser kirim header `ngrok-skip-browser-warning: 1` (SDK/curl tidak terpengaruh) |
+| ngrok berhenti melayani | Kuota bulanan paket gratis habis, atau authtoken dicabut. Cek dashboard ngrok (*Usage*) dan `D:\ollama\logs\ngrok\` |
+| API mati beberapa menit tengah malam | Windows Update me-restart PC (Event ID 1074 oleh `TrustedInstaller.exe`). Atur *Active hours* |
+| Request pertama setelah pindah model ~4 dtk | Normal: `OLLAMA_MAX_LOADED_MODELS=1`, model lain harus dimuat dulu |
