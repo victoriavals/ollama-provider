@@ -1,6 +1,6 @@
 # Technical Decision Records
 
-Semua keputusan di bawah diambil pada sesi desain dan implementasi 2026-09-27. Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
+Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#24 pada 2026-10-15 s.d. 2026-10-17 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
 
 ---
 
@@ -385,3 +385,19 @@ Reason: Hasil terukur: gemma3:4b 100% GPU, 84 tok/dtk, bahasa Indonesia paling n
 Impact: Client memilih model per request. Berpindah model memicu muat ulang ~4 dtk karena `OLLAMA_MAX_LOADED_MODELS=1` (dua model tidak muat bersamaan). Client yang ingin berpikir harus mengirim `reasoning_effort` + `max_tokens` besar. Uji hanya 10 soal sekali jalan, jadi hasilnya arah, bukan kepastian.
 
 Alternative Considered: Ganti total ke qwen3.5:4b, tetap gemma3 saja, qwen3.5:9b (spill ke CPU), `DEFAULT_REASONING_EFFORT=low/medium` (macet).
+
+---
+
+## 25. Pembersihan runner yatim dan upgrade Ollama dengan rollback
+
+Date: 2026-10-17
+
+Context: Dua proses `llama-server.exe` yatim (sisa uji crash 2026-09-27, ketika `ollama.exe` di-kill paksa) memegang ~2,2 GB VRAM selama tiga minggu. Script upgrade lama juga menimpa `D:\ollama\bin` tanpa cadangan.
+
+Decision: `Remove-OrphanOllamaRunners` (`scripts/common.ps1`) membunuh `llama-server.exe` yang induknya sudah mati, dan otomatis dipanggil oleh `Stop-ServiceSafe OllamaServe`. `upgrade.ps1` mengunduh dulu, me-rename `bin` → `bin.previous`, mengekstrak ke `bin` bersih, dan rollback otomatis bila Ollama tidak merespons.
+
+Reason: VRAM adalah sumber daya paling langka di mesin ini (8 GB). Upgrade harus bisa dibatalkan tanpa akses fisik, karena pemilik sering jauh.
+
+Impact: Upgrade 0.34.4 → 0.40.5 berjalan dengan downtime ~1 menit. Tidak boleh lagi `Stop-Process` langsung pada `ollama.exe` (memory.md #16).
+
+Alternative Considered: Membersihkan secara manual saat ditemukan; backup manual sebelum upgrade.
