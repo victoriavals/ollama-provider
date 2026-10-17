@@ -17,7 +17,7 @@
 | Upstream | Ollama (`http://127.0.0.1:11434`), memakai endpoint OpenAI-compat `/v1/*` dan native `/api/*` |
 | Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Windows Service via **WinSW v2.12**, Cloudflare Tunnel |
 | Package manager | `uv` (`uv.lock`) |
-| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **71 test** |
+| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **74 test** |
 | Bahasa dokumentasi | Indonesia (README, `.agents/`), komentar kode dalam Bahasa Inggris |
 
 ## Arsitektur singkat
@@ -39,10 +39,10 @@ Client --HTTPS--> Cloudflare edge --> cloudflared [service Cloudflared]
 |---|---|
 | `OllamaServe` (Ollama 0.34.4, `D:\ollama\bin`, model di `D:\ollama\models`) | Terpasang, Running, Automatic |
 | `OllamaGateway` | Terpasang, Running, Automatic |
-| `NgrokTunnel` | **Belum terpasang**. Jalur publik gratis yang dipilih pemilik (2026-10-15); menunggu authtoken + domain statis ngrok dari pemilik |
+| `NgrokTunnel` | Terpasang 2026-10-16, Running, Automatic. Domain statis gratis (`*.ngrok-free.dev`) ada di `D:\ollama\ngrok\ngrok.yml`; **sengaja tidak ditulis di repo publik** |
 | `Cloudflared` | **Belum terpasang**. Alternatif berbayar (butuh domain); script tetap tersedia |
 | Model | `gemma3:4b` saja (100% GPU, context 8192) |
-| Git | Repo sudah di-`init` (branch `main`) tetapi **belum ada commit** |
+| Git | Branch `main`, remote publik `github.com/victoriavals/ollama-provider`. Agent Codex juga bekerja di repo ini: cek `.git/*.lock` dan proses `codex` sebelum operasi git |
 | Tray app Ollama (milik user Windows "User") | Autostart dimatikan (`Ollama.lnk` → `Ollama.lnk.disabled`), tidak di-uninstall |
 
 ## Pengetahuan kritis (jebakan yang pernah terjadi)
@@ -62,6 +62,7 @@ Client --HTTPS--> Cloudflare edge --> cloudflared [service Cloudflared]
 13. **Inferensi CUDA pertama untuk akun SYSTEM** setelah install atau upgrade driver bisa memakan sekitar 30 detik (sekali saja, lalu ter-cache). Setelah itu, restart Ollama hanya menambah sekitar 3 detik, dan biaya itu sudah dibayar oleh warm-up (inferensi 1 token).
 14. **Folder repo dimiliki user Windows "User"**, sedangkan shell berjalan sebagai "dev". Git butuh `safe.directory` (sudah ditambahkan di config global user dev).
 15. **Pengelompokan usage per hari memakai tanggal UTC** (`substr(ts,1,10)`), sedangkan log file memakai waktu lokal (WIB, +07:00).
+16. **Jangan `Stop-Process` langsung pada `ollama.exe`.** Runner anaknya (`llama-server.exe`) tertinggal sebagai proses yatim dan tetap memegang VRAM (pernah 2 runner yatim memakan ~2.2 GB). Hentikan lewat service (`Stop-ServiceSafe OllamaServe`, yang otomatis memanggil `Remove-OrphanOllamaRunners`).
 
 ## Aturan wajib untuk AI Agent
 
