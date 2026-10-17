@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # Headers carrying the real client IP, set by the tunnel in front of port 8000
     # (Cloudflare: cf-connecting-ip; Tailscale Funnel / ngrok: x-forwarded-for, last entry used)
     client_ip_headers: str = "cf-connecting-ip,x-forwarded-for"
+    # Public base URL shown in the admin dashboard (e.g. https://xyz.ngrok-free.dev/v1). Kept in
+    # .env only, so the domain never lands in the public repo.
+    public_base_url: str = ""
+    # Host headers the admin app accepts (blocks DNS-rebinding pages from reaching port 8001)
+    admin_allowed_hosts: str = "127.0.0.1,localhost"
 
     # Storage
     db_path: Path = BASE_DIR / "data" / "gateway.db"
@@ -71,6 +76,10 @@ class Settings(BaseSettings):
     @classmethod
     def _resolve_path(cls, v: Path) -> Path:
         return v if v.is_absolute() else BASE_DIR / v
+
+    @property
+    def admin_allowed_host_list(self) -> list[str]:
+        return [h.strip() for h in self.admin_allowed_hosts.split(",") if h.strip()]
 
     @property
     def client_ip_header_list(self) -> tuple[str, ...]:
