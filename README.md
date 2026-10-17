@@ -23,7 +23,12 @@ Port 8001 (admin) dan 11434 (Ollama) tidak pernah dibuka lewat tunnel.
 | Ollama | 0.40.5 (`D:\ollama\bin`, model di `D:\ollama\models`) |
 | Model | `gemma3:4b` (utama) dan `qwen3.5:4b` (tools/JSON), ~3 GB masing-masing, 100% di GPU. Hanya satu yang dimuat sekaligus |
 
-- Default 4 request diproses paralel di GPU (`OLLAMA_NUM_PARALLEL=4` = `GLOBAL_CONCURRENCY=4`). Request berikutnya menunggu maksimal 20 detik, lalu dibalas `503 server_busy`.
+- **Kapasitas** (uji beban 2026-10-18):
+  - `gemma3:4b` memproses **4 request bersamaan** (`OLLAMA_NUM_PARALLEL=4` = `GLOBAL_CONCURRENCY=4`): ~69 token/detik per request, total ~265 token/detik.
+  - `qwen3.5:4b` hanya **1 request sekaligus**, karena arsitekturnya belum mendukung paralel di Ollama 0.40.5: ~73 token/detik.
+  - Request lain mengantre. Yang menunggu slot lebih dari 20 detik dibalas `503 server_busy`.
+  - Setiap key default maksimal 2 request bersamaan; lebih dari itu dibalas `429`.
+  - Detail: `.agents/operations.md` bagian Kapasitas.
 - Dari 8 GB VRAM, sekitar 2 GB dipakai desktop Windows dan aplikasi lain, sehingga ruang realistis untuk model ~6 GB. Model kelas 8–9B (bobot > 6 GB) akan tumpah ke CPU dan jauh lebih lambat; `qwen3.5:9b` hanya 87% di GPU dan 41 token/detik.
 
 ## Untuk client: cara memakai API
@@ -73,7 +78,8 @@ Client berbasis **browser** perlu menambahkan header `ngrok-skip-browser-warning
 | `gemma3:4b` | Percakapan umum bahasa Indonesia (default) | Bahasa paling natural di uji kami; tanpa tools. Dimuat sejak start |
 | `qwen3.5:4b` | Tools/function calling, output JSON terstruktur, gambar | Mode berpikir **mati secara default** (`reasoning_effort: "none"`), sehingga jawaban cepat. Akurasi fakta & nuansa bahasa Indonesia lebih lemah dari gemma3 |
 
-- VRAM hanya cukup untuk satu model; request pertama setelah berpindah model butuh ~4 detik untuk memuat.
+- VRAM hanya cukup untuk satu model; request pertama setelah berpindah model butuh ~4 detik untuk memuat. Hindari memakai kedua model secara bersamaan, karena model akan dimuat bergantian dan request saling mengantre.
+- `qwen3.5:4b` hanya memproses satu request sekaligus. Untuk beban paralel, pakai `gemma3:4b`.
 - `reasoning_effort` (khusus `qwen3.5:4b`): `none` (default), `medium`, atau `high`. Saat berpikir dinyalakan, beri `max_tokens` besar (mis. 2048), karena token berpikir ikut dihitung. `medium` kadang berpikir sampai batas token tanpa menjawab; `low` ditolak karena di uji kami selalu begitu.
 - `qwen3.5:4b` tidak mendukung `/v1/completions` (Ollama mengembalikan teks kosong untuk model berpikir); gunakan `/v1/chat/completions`.
 - Hasil uji perbandingan (10 soal bahasa Indonesia, 3 model) dan alasannya ada di `.agents/decisions.md` #24.
@@ -348,7 +354,8 @@ Setelah mengubah `.env`, jalankan `Restart-Service OllamaGateway`. Env var milik
 | Jawaban `qwen3.5:4b` kosong (`finish_reason: length`) | Mode berpikir menghabiskan token. Pastikan `DEFAULT_REASONING_EFFORT=none`; bila client menyalakan berpikir, beri `max_tokens` besar |
 | `/v1/completions` ke qwen ditolak 400 | Disengaja (Ollama mengembalikan teks kosong untuk model berpikir); pakai `/v1/chat/completions` |
 | Request pertama lambat (~4 detik) setelah ganti model | Normal: hanya satu model muat di VRAM |
-| Request pertama sangat lambat (~30–40 detik) setelah update driver/install | Kompilasi kernel CUDA untuk akun SYSTEM, hanya sekali (cache di `C:\Windows\System32\config\systemprofile\AppData\Roaming\NVIDIA\ComputeCache`) |
+| Respons `qwen3.5:4b` lambat atau `503 server_busy` saat ramai | qwen hanya memproses 1 request sekaligus, sisanya mengantre. Arahkan beban paralel ke `gemma3:4b` |
+| Request pertama sangat lambat (~15–40 detik) setelah update driver/install | Kompilasi kernel CUDA untuk akun SYSTEM, sekali per model dan ukuran prompt (cache di `C:\Windows\System32\config\systemprofile\AppData\Roaming\NVIDIA\ComputeCache`) |
 | VRAM penuh padahal hanya satu model | Runner `llama-server` yatim. `Get-Process llama-server` (harus 1); bersihkan dengan `. .\scripts\common.ps1; Remove-OrphanOllamaRunners` |
 | Model tidak 100% GPU (`/admin/status`) | Turunkan `OLLAMA_NUM_PARALLEL` / context (`install-ollama.ps1 -SkipDownload -NumParallel 2`), lalu samakan `GLOBAL_CONCURRENCY`; atau pakai model lebih kecil |
 | API mati beberapa menit tengah malam | Windows Update me-restart PC. Atur *Active hours* |
