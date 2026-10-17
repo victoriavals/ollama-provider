@@ -1,6 +1,6 @@
 # Feature Documentation
 
-Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**, atau **Unknown**. Keterangan "diuji live" berarti sudah dicoba ke Ollama/service sungguhan di mesin ini pada 2026-09-27.
+Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**, **Tidak dipakai** (kode ada, sengaja tidak di-deploy), atau **Unknown**. Keterangan "diuji live" berarti sudah dicoba ke Ollama/service sungguhan di mesin ini pada 2026-09-27.
 
 ## Ringkasan
 
