@@ -73,7 +73,7 @@ Notes: `prompt` berupa array ditolak (400). Fixture stream (`tests/fixtures/comp
 
 Purpose: Menyediakan model dengan tools/function calling dan output terstruktur di samping `gemma3:4b`, tanpa jawaban kosong akibat mode berpikir.
 
-Status: Completed (2026-10-17). Diuji live lewat URL publik dengan SDK OpenAI: chat, stream (TTFT 0,13 dtk), gambar, tools (`cek_cuaca(kota="Bandung")`), 4 paralel, perpindahan model (~4 dtk), penolakan `/v1/completions` dan `reasoning_effort` tidak valid.
+Status: Completed (2026-10-17). Diuji live lewat URL publik dengan SDK OpenAI: chat, stream (TTFT 0,13 dtk), gambar, tools (`cek_cuaca(kota="Bandung")`), 4 request bersamaan (sukses, tetapi uji kapasitas 2026-10-18 menunjukkan Ollama memprosesnya berurutan, lihat Notes), perpindahan model (~4 dtk), penolakan `/v1/completions` dan `reasoning_effort` tidak valid.
 
 Location: `gateway/sanitize.py` (`REASONING_EFFORTS`, `sanitize_chat`, `sanitize_completion`), `gateway/config.py` (`default_reasoning_effort`)
 
@@ -81,7 +81,7 @@ Important Files: `sanitize.py`, `tests/test_sanitize.py`, `tests/fixtures/chat_s
 
 Dependencies: Ollama ≥ 0.40.5 (format OpenAI-compat dengan field `reasoning`), capability `thinking` dari `/api/show`
 
-Notes: Hasil uji perbandingan (10 prompt Indonesia): gemma3:4b paling natural; qwen3.5:4b unggul di tools/format tapi lebih lemah di fakta & nuansa bahasa; qwen3.5:9b paling akurat tapi 87% GPU dan 2× lebih lambat, sehingga dihapus. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default).
+Notes: Hasil uji perbandingan (10 prompt Indonesia): gemma3:4b paling natural; qwen3.5:4b unggul di tools/format tapi lebih lemah di fakta & nuansa bahasa; qwen3.5:9b paling akurat tapi 87% GPU dan 2× lebih lambat, sehingga dihapus. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default). Ollama 0.40.5 hanya menjalankan **1 request qwen sekaligus** (arsitektur `qwen35`), lihat [operations.md#kapasitas](operations.md#kapasitas).
 
 ## Embeddings
 
@@ -179,7 +179,7 @@ Important Files: `limits.py`, `proxy.py`
 
 Dependencies: `GLOBAL_CONCURRENCY` (= `OLLAMA_NUM_PARALLEL` = 4), `QUEUE_TIMEOUT_S` (20), `DEFAULT_MAX_CONCURRENT` (2)
 
-Notes: Slot key penuh → 429 langsung. Slot global penuh > 20 dtk → 503 `server_busy`.
+Notes: Slot key penuh → 429 langsung. Slot global penuh > 20 dtk → 503 `server_busy`. Gateway belum membatasi per model, padahal `qwen3.5:4b` hanya punya 1 slot di Ollama. Hasil uji kapasitas: [operations.md#kapasitas](operations.md#kapasitas).
 
 ## Limit Gagal-Auth per IP
 
