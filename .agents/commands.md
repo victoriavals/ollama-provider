@@ -158,6 +158,7 @@ curl.exe -s http://127.0.0.1:11434/api/show -d '{\"model\":\"qwen3.5:4b\"}'     
 - Cek muat 100% di GPU setelah menambah model: `curl.exe http://127.0.0.1:11434/api/ps` (`size_vram` harus sama dengan `size`).
 - Uji mode berpikir model baru: `reasoning_effort` `none`/`medium`/`high` lewat `/v1/chat/completions`, dengan `max_tokens` besar. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default).
 - Uji perbandingan model dijalankan dengan script sementara di scratchpad (bukan di repo). Metodenya: prompt Indonesia per model berurutan, `/api/chat` native untuk `eval_count`/`eval_duration`, uji beban 4 paralel, lalu warm-up `gemma3:4b` lagi.
+- Uji kapasitas (2026-10-18) juga memakai script sementara. Script mengirim N stream `/v1/chat/completions` bersamaan, langsung ke `127.0.0.1:11434/v1` dan lewat gateway `127.0.0.1:8000/v1`. Key sementara dibuat dengan `gateway.cli create-key --name loadtest-... --max-concurrent 16` lalu dicabut di blok `finally`. Metrik: TTFT, tok/dtk per stream, total tok/dtk, kode error, VRAM (`nvidia-smi`). Akhiri dengan memuat ulang `gemma3:4b`. Hasil: [operations.md#kapasitas](operations.md#kapasitas).
 
 ## Setelah PC restart
 
