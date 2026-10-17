@@ -18,7 +18,7 @@ Port 8001 dan 11434 tidak pernah dibuka lewat tunnel.
 | CPU | Intel i5-13400F (10C/16T) |
 | GPU | RTX 4060 Ti 8 GB VRAM |
 | RAM | 32 GB DDR5-5600 |
-| Model | `gemma3:4b` (Q4_K_M, ~3.3 GB), muat penuh di GPU |
+| Model | `gemma3:4b` (utama) dan `qwen3.5:4b` (tools/JSON), masing-masing ~3 GB dan muat penuh di GPU. Hanya satu yang dimuat sekaligus (Ollama 0.40.5) |
 
 Default: 4 request diproses paralel di GPU (`OLLAMA_NUM_PARALLEL=4` = `GLOBAL_CONCURRENCY=4`). Request berikutnya menunggu maksimal 20 detik, lalu dibalas `503 server_busy`.
 
@@ -134,11 +134,22 @@ LangChain: `ChatOpenAI(base_url="https://llm.<domain>/v1", api_key="sk-...", mod
 |---|---|
 | `GET /v1/models` | model yang di-enable |
 | `POST /v1/chat/completions` | stream & non-stream, gambar (`image_url`, maks 2) |
-| `POST /v1/completions` | `prompt` string |
+| `POST /v1/completions` | `prompt` string (hanya untuk model tanpa mode berpikir, mis. `gemma3:4b`) |
 | `POST /v1/embeddings` | hanya untuk model embedding (gemma3 → 400) |
 | `GET /health`, `GET /health/ready` | tanpa auth |
 
-Field yang diteruskan ke Ollama hanya: `model, messages, prompt, input, stream, stream_options, max_tokens` (`max_completion_tokens` dipetakan ke sini), `temperature, top_p, stop, seed, presence_penalty, frequency_penalty, response_format, user`. `tools` hanya diteruskan jika modelnya mendukung. Field lain (`options`, `keep_alive`, `num_ctx`, `think`, ...) dibuang. `max_tokens` di-cap ke `MAX_TOKENS_CAP` (default 2048) supaya request non-stream selesai sebelum batas 100 detik Cloudflare.
+Field yang diteruskan ke Ollama hanya: `model, messages, prompt, input, stream, stream_options, max_tokens` (`max_completion_tokens` dipetakan ke sini), `temperature, top_p, stop, seed, presence_penalty, frequency_penalty, response_format, user`, serta `reasoning_effort` untuk model yang bisa berpikir. `tools` hanya diteruskan jika modelnya mendukung. Field lain (`options`, `keep_alive`, `num_ctx`, `think`, ...) dibuang. `max_tokens` di-cap ke `MAX_TOKENS_CAP` (default 2048) supaya request non-stream selesai sebelum batas 100 detik Cloudflare.
+
+### Memilih model
+
+| Model | Pakai untuk | Catatan |
+|---|---|---|
+| `gemma3:4b` | Percakapan umum bahasa Indonesia (default) | Bahasa paling natural di uji kami; tanpa tools. Dimuat sejak start |
+| `qwen3.5:4b` | Tools/function calling, output JSON terstruktur, gambar | Mode berpikir **mati secara default** (`reasoning_effort: "none"`), sehingga jawaban cepat. Akurasi fakta & nuansa bahasa Indonesia lebih lemah dari gemma3 |
+
+- VRAM hanya cukup untuk satu model; request pertama setelah berpindah model butuh ~4 detik untuk memuat.
+- `reasoning_effort` (khusus `qwen3.5:4b`): `none` (default), `medium`, atau `high`. Saat berpikir dinyalakan, beri `max_tokens` besar (mis. 2048), karena token berpikir ikut dihitung. `medium` kadang berpikir sampai batas token dan tidak menjawab; `low` ditolak karena di uji kami selalu begitu.
+- `qwen3.5:4b` tidak mendukung `/v1/completions` (Ollama mengembalikan teks kosong untuk model berpikir); gunakan `/v1/chat/completions`.
 
 ### Error & limit
 
