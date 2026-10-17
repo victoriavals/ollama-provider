@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     queue_timeout_s: float = 20.0
     stream_ping_interval_s: float = 15.0
 
+    # Thinking models: reasoning_effort applied when the client sends none ("" = model default).
+    # "none" keeps answers fast; with thinking on, qwen3.5 often used the whole token budget.
+    default_reasoning_effort: str = "none"
+
     # Request limits
     max_tokens_cap: int = 2048
     max_body_bytes: int = 4_000_000
@@ -71,6 +75,14 @@ class Settings(BaseSettings):
     monitor_paths: str = ""
     disk_warn_gb: float = 10.0
     gpu_temp_warn_c: float = 85.0
+
+    @field_validator("default_reasoning_effort")
+    @classmethod
+    def _check_reasoning_effort(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"", "none", "medium", "high"}:
+            raise ValueError("DEFAULT_REASONING_EFFORT must be empty, none, medium or high")
+        return v
 
     @field_validator("db_path", "log_dir")
     @classmethod
