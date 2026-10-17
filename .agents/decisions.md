@@ -369,3 +369,19 @@ Reason: Halaman ini memegang `ADMIN_KEY`, jadi tidak boleh memuat kode pihak ket
 Impact: Akses dari jarak jauh harus lewat remote desktop. Kontrol service (start/stop) sengaja tidak ada di dashboard, karena gateway berjalan sebagai LocalService tanpa hak mengatur service; gunakan script PowerShell.
 
 Alternative Considered: Framework SPA + Chart.js dari CDN, mengekspos dashboard lewat ngrok dengan login.
+
+---
+
+## 24. Model: gemma3:4b utama + qwen3.5:4b untuk tools, mode berpikir mati secara default
+
+Date: 2026-10-17
+
+Context: Riset web merekomendasikan `qwen3.5:4b` (skor benchmark tinggi, tools, Apache-2.0). Pemilik juga bertanya kenapa bukan `qwen3.5:9b`. Ollama di-upgrade 0.34.4 → 0.40.5 (`scripts/upgrade.ps1`, kini dengan backup `bin.previous` + rollback otomatis) dan tiga model diuji dengan 10 prompt bahasa Indonesia + uji beban 4 paralel.
+
+Decision: `gemma3:4b` tetap model utama (warm-up), `qwen3.5:4b` diaktifkan sebagai model kedua untuk tools/JSON/gambar, `qwen3.5:9b` dihapus. Gateway menyuntik `reasoning_effort` = `DEFAULT_REASONING_EFFORT` (`none`) untuk model ber-capability `thinking`, memvalidasi nilai client (`none`/`medium`/`high`), dan menolak `/v1/completions` untuk model berpikir.
+
+Reason: Hasil terukur: gemma3:4b 100% GPU, 84 tok/dtk, bahasa Indonesia paling natural (meski salah fakta ibu kota Kaltim). qwen3.5:4b 100% GPU, 76 tok/dtk, VRAM lebih hemat, tools berfungsi, tetapi tanpa berpikir lebih sering salah nuansa (“postponed” → “dibatalkan”, arti “PHP”) dan sesekali berhalusinasi; dengan berpikir default 7/10 jawaban kosong karena token habis. `reasoning_effort: "low"` selalu berpikir sampai 2048 token tanpa jawaban; `medium` 2/5 macet. qwen3.5:9b paling akurat tetapi hanya 87% di GPU (VRAM total 7,3 GB), 41 tok/dtk.
+
+Impact: Client memilih model per request. Berpindah model memicu muat ulang ~4 dtk karena `OLLAMA_MAX_LOADED_MODELS=1` (dua model tidak muat bersamaan). Client yang ingin berpikir harus mengirim `reasoning_effort` + `max_tokens` besar. Uji hanya 10 soal sekali jalan, jadi hasilnya arah, bukan kepastian.
+
+Alternative Considered: Ganti total ke qwen3.5:4b, tetap gemma3 saja, qwen3.5:9b (spill ke CPU), `DEFAULT_REASONING_EFFORT=low/medium` (macet).
