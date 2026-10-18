@@ -71,8 +71,9 @@ Konfigurasi uvicorn: `lifespan="off"`, `access_log=False`, `log_config=None`, `s
 | `Settings` | `config.py` | Semua konfigurasi dari env / `.env` | Semua |
 | `Gateway` | `core.py` | Container state bersama + background task | Kedua app (`app.state.gw`) |
 | `Database`, `UsageRecord`, `UsageWriter` | `db.py` | Schema, query, penulisan usage secara batch | `Gateway`, CLI |
-| `OllamaClient` | `ollama.py` | `httpx.AsyncClient` ke Ollama, cache capability, pull/delete/warm-up | proxy, admin, health |
-| `SlidingWindow`, `FailedAuthLimiter`, `ConcurrencyGate`, `RateResult` | `limits.py` | RPM per key, gagal-auth per IP, slot per key + global | public app, proxy |
+| `OllamaClient`, `ModelInfo` | `ollama.py` | `httpx.AsyncClient` ke Ollama, cache capability + arsitektur (`/api/show`), pull/delete/warm-up | proxy, admin, health |
+| `SlidingWindow`, `FailedAuthLimiter`, `ConcurrencyGate`, `RateResult` | `limits.py` | RPM per key, gagal-auth per IP, slot per key (fail fast) | public app, proxy |
+| `GpuScheduler`, `Ticket`, `resolve_capacity` | `scheduler.py` | Antrean GPU sadar-model: jalur FIFO per model, kapasitas per model, giliran satu model, batas antrean & waktu tunggu | proxy, warm-up, `/admin/status` |
 | `KeyCache`, `require_api_key`, `require_admin` | `auth.py` | Lookup key (hash SHA-256), dependency FastAPI | public/admin app |
 | `sanitize_*`, `read_json_body` | `sanitize.py` | Allowlist field, validasi, cap `max_tokens`, batas body | public app |
 | `forward_json`, `stream_sse`, `Finalizer`, `ClosingStreamingResponse` | `proxy.py` | Meneruskan request ke Ollama `/v1/*` | public app |
@@ -92,21 +93,25 @@ RequestContextMiddleware  (buat request_id, state.access = {})
        1. gw.rpm.hit(key)                  -> 429 rate_limit_exceeded (+ Retry-After)
        2. read_json_body (hitung byte)     -> 413 / 400
        3. require_model + is_model_enabled -> 404 model_not_found
-       4. ollama.capabilities(model)       -> /api/show (cache 10 menit)
+       4. ollama.model_info(model)         -> /api/show (cache 10 menit): capabilities + arsitektur
        5. sanitize_chat/completion/embeddings -> 400 (payload hanya berisi field allowlist;
           model `thinking` diberi reasoning_effort default, /v1/completions ditolak untuknya)
        6. gate.try_acquire_key             -> 429 concurrency_limit_exceeded
           (setiap APIError di langkah 1-6 -> UsageRecord dengan status error)
+          ctx.gpu_capacity = resolve_capacity(model, arsitektur)  (qwen35 -> 1, lainnya 4)
+       7. scheduler.enqueue(model, kapasitas, QUEUE_TIMEOUT_S) -> Ticket (dipegang Finalizer)
+          antrean penuh (MAX_QUEUE) -> 503 server_busy langsung (juga untuk stream: HTTP 503 asli)
        7a. stream=false -> forward_json():
-             gate.acquire_global(QUEUE_TIMEOUT_S) -> 503 server_busy
+             ticket.wait() -> False (habis waktu) -> 503 server_busy
              POST Ollama /v1/...  -> JSONResponse (status upstream diteruskan)
        7b. stream=true  -> stream_sse() -> ClosingStreamingResponse(_sse generator):
-             yield ": connected"; tunggu slot global sambil yield ": ping" tiap 15 dtk
+             yield ": connected"; tunggu ticket sambil yield ": ping queue=N" tiap 15 dtk
+             habis waktu -> data: {"error": server_busy}
              upstream stream; baca per baris; ambil usage dari chunk terakhir (choices=[])
              buang chunk usage jika client tidak minta include_usage
              error setelah header -> data: {"error": ...}
-       Finalizer() (tepat sekali): lepas slot global + slot key, submit UsageRecord,
-                                    tulis status/token nyata ke state.access
+       Finalizer() (tepat sekali): ticket.close() (keluar antrean / lepas slot GPU), lepas slot key,
+                                    submit UsageRecord, tulis status/token/queue_ms ke state.access
   <- middleware menulis baris JSON ke access-YYYY-MM-DD.log setelah response selesai
 ```
 
@@ -198,6 +203,8 @@ Timeout `httpx`: connect 5 dtk, read 300 dtk, write 30 dtk, pool 30 dtk. Limit k
 - **Shared state container**: satu `Gateway` disimpan di `app.state.gw` untuk kedua app.
 - **Dependency injection FastAPI** untuk auth (`Depends(require_api_key)`, dependency router admin).
 - **Idempotent finalizer**: `Finalizer.__call__` dengan flag `_done`, dipanggil dari generator `finally` **dan** dari `ClosingStreamingResponse.__call__` (untuk kasus generator yang tidak pernah dimulai).
+- **Ticket antrean tanpa race**: `GpuScheduler` hanya mengubah state di method sinkron (enqueue, `Ticket.close`, callback expire), dan setiap perubahan memanggil `_dispatch()`. Future ticket hanya diselesaikan scheduler; pemanggil menunggu dengan `asyncio.wait` tanpa membatalkannya, lalu `Finalizer` menutup ticket tepat sekali.
+- **Giliran model**: satu model memegang GPU; giliran pindah bila model lain menunggu dan giliran sudah ≥ `MODEL_SWITCH_AFTER_S`. Request yang berjalan diselesaikan dulu, sehingga request dikelompokkan per model (detail: [decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)).
 - **Allowlist, bukan denylist**, untuk field request.
 - **Background tasks** lewat `Gateway.spawn()`, yang menyimpan referensi task dan membatalkannya saat stop.
 - **Write-behind queue** untuk usage (`UsageWriter`).
@@ -205,10 +212,10 @@ Timeout `httpx`: connect 5 dtk, read 300 dtk, write 30 dtk, pool 30 dtk. Limit k
 
 ## Aturan arsitektur
 
-1. Semua endpoint yang meneruskan ke Ollama wajib: auth → RPM → validasi/sanitasi → slot key → slot global (dengan batas tunggu) → `Finalizer`.
+1. Semua endpoint yang meneruskan ke Ollama wajib: auth → RPM → validasi/sanitasi → slot key → `GpuScheduler.enqueue` (antrean per model dengan batas tunggu) → `Finalizer` yang memegang ticket-nya. Pemanggilan Ollama yang memakai GPU di luar request client (warm-up) juga lewat scheduler.
 2. Jangan menambah listener yang bind ke `0.0.0.0`. Semua bind ke `127.0.0.1`; akses luar hanya lewat agen tunnel (ngrok, atau cloudflared bila dipasang).
 3. Route admin tidak boleh dipasang di app publik, begitu pula sebaliknya.
-4. `GLOBAL_CONCURRENCY` harus sama dengan `OLLAMA_NUM_PARALLEL` (di XML service `OllamaServe`).
-5. Request non-stream sebaiknya selesai < 100 dtk (batas first-byte Cloudflare; dijaga lewat `MAX_TOKENS_CAP`), supaya tetap aman bila tunnel dipindah ke Cloudflare.
+4. `GLOBAL_CONCURRENCY` harus sama dengan `OLLAMA_NUM_PARALLEL` (di XML service `OllamaServe`). Scheduler mengasumsikan `OLLAMA_MAX_LOADED_MODELS=1` (satu model berjalan sekaligus). Model yang dipaksa 1 slot oleh Ollama harus tercakup `SERIAL_ARCHITECTURES` atau `MODEL_PARALLEL`.
+5. Request non-stream sebaiknya selesai < 100 dtk (batas first-byte Cloudflare; dijaga lewat `MAX_TOKENS_CAP` dan `QUEUE_TIMEOUT_S` 60 dtk + generasi ≤ ~30 dtk), supaya tetap aman bila tunnel dipindah ke Cloudflare.
 6. Kode baru yang blocking harus lewat `asyncio.to_thread`. Event loop dipakai bersama oleh kedua server.
 7. Dashboard tetap statis dan tanpa dependency pihak ketiga. Fitur baru memakai admin API yang ada, bukan endpoint publik.
