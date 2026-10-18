@@ -8,7 +8,7 @@ Konvensi di bawah diambil dari kode yang ada. Ikuti pola ini saat menambah kode.
 |---|---|---|
 | Modul Python | lowercase satu kata | `proxy.py`, `limits.py`, `health.py` |
 | Class | PascalCase, kata benda | `Gateway`, `UsageWriter`, `ConcurrencyGate`, `HealthMonitor` |
-| Fungsi/method | snake_case, kata kerja | `lookup_key`, `acquire_global`, `sanitize_chat` |
+| Fungsi/method | snake_case, kata kerja | `lookup_key`, `try_acquire_key`, `sanitize_chat` |
 | Helper privat | awalan `_` | `_generate`, `_bearer`, `_purge`, `_log_transitions` |
 | Konstanta modul | UPPER_SNAKE | `CACHE_TTL_S`, `QUIET_PATHS`, `REWARM_MIN_INTERVAL_S` |
 | Satuan di nama | sufiks `_s`, `_ms`, `_gb`, `_c`, `_bytes` | `queue_timeout_s`, `latency_ms`, `disk_warn_gb`, `max_body_bytes` |
@@ -78,7 +78,7 @@ data/  logs/        runtime, gitignored, jangan di-commit
 
 ## Performance rules
 
-1. Satu worker. Konkurensi GPU diatur oleh `ConcurrencyGate` (`GLOBAL_CONCURRENCY` = `OLLAMA_NUM_PARALLEL`) dengan batas tunggu `QUEUE_TIMEOUT_S`.
+1. Satu worker. Slot GPU dibagikan oleh `GpuScheduler` (`scheduler.py`): jalur per model, `GLOBAL_CONCURRENCY` = `OLLAMA_NUM_PARALLEL`, batas tunggu `QUEUE_TIMEOUT_S`, batas antrean `MAX_QUEUE`. Jangan memanggil endpoint generasi Ollama tanpa ticket scheduler. State scheduler hanya diubah lewat method sinkron (tanpa `await` di tengah perubahan state).
 2. Middleware harus pure ASGI. Jangan `BaseHTTPMiddleware` atau `GZipMiddleware`, dan jangan set `Content-Length` pada SSE.
 3. SSE: teruskan setiap baris segera (`aiter_lines`) dengan header `Cache-Control: no-cache` dan `X-Accel-Buffering: no`.
 4. Pakai satu `httpx.AsyncClient` bersama (`gw.ollama.http`) dengan timeout eksplisit. Jangan membuat client per request.
@@ -97,7 +97,7 @@ data/  logs/        runtime, gitignored, jangan di-commit
 
 ## Testing rules
 
-- `uv run pytest` harus hijau (saat ini 79 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
+- `uv run pytest` harus hijau (saat ini 100 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
 - Ollama selalu di-mock: fixture `ollama` (respx `MockRouter`) dipasang ke `Gateway(..., ollama_transport=httpx.MockTransport(router.async_handler))`.
 - Gunakan fixture: `gw`, `public`, `admin`, `api_key`, `auth`, helper `new_key()` dan `flush_usage()` (`tests/conftest.py`).
 - Setting test via `make_settings()`: `health_interval_s=0`, `watch_services=""`, `log_dir=tmp_path/"logs"`, `warmup=False`. Test tidak boleh menyentuh service, GPU, atau jaringan sungguhan (kecuali `test_service_states_on_windows`, yang di-skip di non-Windows).
