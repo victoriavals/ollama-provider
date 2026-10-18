@@ -58,6 +58,10 @@ function Show-Status {
         }
         $c = $status.gateway.concurrency
         Write-Host ("  GPU slots: {0}/{1} busy, {2} waiting   uptime {3:N0} min" -f $c.active, $c.global_limit, $c.waiting, ($status.gateway.uptime_s / 60))
+        foreach ($l in $c.lanes) {
+            $mark = if ($c.turn -and $c.turn.model -eq $l.model) { '*' } else { ' ' }
+            Write-Host ("  {0} queue {1,-20} {2}/{3} running, {4} waiting (oldest {5}s)" -f $mark, $l.model, $l.running, $l.capacity, $l.waiting, $l.oldest_wait_s)
+        }
         foreach ($m in $status.ollama.loaded_models) {
             $pct = if ($m.size) { [math]::Round(100 * $m.size_vram / $m.size) } else { 0 }
             Write-Host ("  loaded: {0}  {1}% GPU  ctx {2}" -f $m.name, $pct, $m.context_length)
