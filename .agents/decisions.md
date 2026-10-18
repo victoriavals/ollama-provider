@@ -440,6 +440,13 @@ Impact:
 - Slot per key ikut tertahan lebih lama saat antre (≤ 60 dtk), sehingga key dengan batas 2 lebih cepat mendapat `429 concurrency_limit_exceeded`.
 - Setiap upgrade Ollama: cek ulang log `does not currently support parallel requests` dan sesuaikan `SERIAL_ARCHITECTURES`.
 - Re-warm health monitor (#17) dilewati selama scheduler punya request berjalan atau antre, karena saat model berganti Ollama sesaat melaporkan "tidak ada model dimuat".
+- Setelah QA (review kode independen + uji live, 2026-10-18):
+  - umur giliran dihitung ulang saat model mulai lagi dari GPU senggang (sebelumnya waktu senggang ikut dihitung, sehingga burst setelah senggang langsung gantian model);
+  - warm-up hanya berjalan bila slot langsung tersedia;
+  - shutdown melepas antrean dengan 503 "the server is restarting";
+  - kapasitas dihitung sebelum slot key diambil (mencegah slot bocor);
+  - setting antrean menolak NaN/inf.
+- ngrok membuang baris komentar SSE, sehingga ping antrean tidak sampai lewat ngrok. Ini tidak masalah, karena koneksi yang diam 60 dtk lewat ngrok sudah diuji aman. Ping tetap dikirim untuk Cloudflare (batas first-byte 100 dtk).
 - Hasil uji ulang (operations.md#setelah-scheduler-sadar-model-2026-10-18): 12 gemma × 1024 token 12/12 sukses (sebelumnya 8/12), 8 qwen × 512 token 8/8 sukses (sebelumnya 6/8), soak campuran 2 menit 70/70 sukses.
 
 Alternative Considered:
