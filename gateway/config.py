@@ -44,7 +44,17 @@ class Settings(BaseSettings):
 
     # GPU capacity: keep equal to OLLAMA_NUM_PARALLEL
     global_concurrency: int = 4
-    queue_timeout_s: float = 20.0
+    # Model-aware queue (gateway/scheduler.py): longest wait for a GPU slot, then 503 server_busy
+    queue_timeout_s: float = 60.0
+    # Requests waiting across all models; beyond this new requests get 503 at once
+    max_queue: int = 32
+    # One model runs at a time (OLLAMA_MAX_LOADED_MODELS=1). The running model keeps the GPU at
+    # least this long before yielding to a waiting request for another model.
+    model_switch_after_s: float = 10.0
+    # Parallel slots per model, e.g. "qwen3.5:4b=1" (others: see serial_architectures / global)
+    model_parallel: str = ""
+    # Architectures (/api/show general.architecture) Ollama runs one request at a time
+    serial_architectures: str = "qwen35"
     stream_ping_interval_s: float = 15.0
 
     # Thinking models: reasoning_effort applied when the client sends none ("" = model default).
@@ -84,6 +94,19 @@ class Settings(BaseSettings):
             raise ValueError("DEFAULT_REASONING_EFFORT must be empty, none, medium or high")
         return v
 
+    @field_validator("model_parallel")
+    @classmethod
+    def _check_model_parallel(cls, v: str) -> str:
+        _parse_model_parallel(v)
+        return v
+
+    @field_validator("max_queue", "model_switch_after_s", "queue_timeout_s")
+    @classmethod
+    def _non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
+
     @field_validator("db_path", "log_dir")
     @classmethod
     def _resolve_path(cls, v: Path) -> Path:
@@ -104,6 +127,28 @@ class Settings(BaseSettings):
     @property
     def seed_model_list(self) -> list[str]:
         return [m.strip() for m in self.seed_models.split(",") if m.strip()]
+
+    @property
+    def model_parallel_map(self) -> dict[str, int]:
+        return _parse_model_parallel(self.model_parallel)
+
+    @property
+    def serial_architecture_set(self) -> frozenset[str]:
+        return frozenset(a.strip().lower() for a in self.serial_architectures.split(",") if a.strip())
+
+
+def _parse_model_parallel(value: str) -> dict[str, int]:
+    """'qwen3.5:4b=1,foo=2' -> {'qwen3.5:4b': 1, 'foo': 2} (split on the last '=')."""
+    result: dict[str, int] = {}
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, slots = entry.rpartition("=")
+        if not sep or not name.strip() or not slots.strip().isdigit() or int(slots) < 1:
+            raise ValueError(f"MODEL_PARALLEL entry {entry!r} must look like model=N with N >= 1")
+        result[name.strip()] = int(slots)
+    return result
 
 
 @lru_cache
