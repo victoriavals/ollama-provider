@@ -103,6 +103,8 @@ async def _generate(request: Request, key: ApiKey, endpoint: str) -> Response:
             payload, include_usage = sanitize_embeddings(body, caps, s), False
         else:
             payload, include_usage = sanitizer(body, caps, s)
+        gpu_capacity = resolve_capacity(s, model, info.architecture)
+        # Last step that can fail: everything after it must leave the key slot to the Finalizer.
         if not gw.gate.try_acquire_key(key.id, key.max_concurrent or s.default_max_concurrent):
             raise APIError(429, "Too many concurrent requests for this API key.",
                            code="concurrency_limit_exceeded", headers={"Retry-After": "2"})
@@ -114,8 +116,7 @@ async def _generate(request: Request, key: ApiKey, endpoint: str) -> Response:
 
     # From here the key slot is owned by the proxy, which releases it when the request ends.
     ctx = RequestContext(key=key, endpoint=endpoint, model=model, request_id=request_id, client_ip=ip,
-                         rate_headers=rate.headers(), access=access,
-                         gpu_capacity=resolve_capacity(s, model, info.architecture))
+                         rate_headers=rate.headers(), access=access, gpu_capacity=gpu_capacity)
     if payload.get("stream"):
         return stream_sse(gw, path, payload, ctx, include_usage)
     return await forward_json(gw, path, payload, ctx)
