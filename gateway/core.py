@@ -90,11 +90,12 @@ class Gateway:
         if not models:
             return
         name = models[0]["name"]
-        # Through the scheduler, so a warm-up never swaps models under running requests.
-        ticket = self.scheduler.enqueue(name, None, self.settings.queue_timeout_s)
+        # Through the scheduler, and only if the GPU is free right now: a queued warm-up would make
+        # the running model yield and swap models just to load the primary one.
+        ticket = self.scheduler.enqueue(name, None, 0)
         try:
-            if ticket is None or not await ticket.wait():
-                log.info("warm-up of %s skipped: GPU queue is busy", name)
+            if ticket is None or not ticket.granted:
+                log.info("warm-up of %s skipped: GPU is busy", name)
                 return
             await self.ollama.warmup(name)
         except Exception as exc:
