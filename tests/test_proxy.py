@@ -3,7 +3,7 @@ import json
 import httpx
 
 from gateway.proxy import RequestContext, stream_sse
-from tests.conftest import fixture_json, fixture_text, flush_usage, new_key
+from tests.conftest import fixture_json, fixture_text, flush_usage, hold_slots, new_key, scheduler_idle
 
 CHAT = {"model": "gemma3:4b", "messages": [{"role": "user", "content": "Say hi in 3 words"}]}
 
@@ -121,8 +121,7 @@ async def test_per_key_concurrency_limit(public, auth, gw, api_key):
 
 
 async def test_server_busy_when_all_gpu_slots_taken(public, auth, gw):
-    for _ in range(gw.settings.global_concurrency):
-        assert await gw.gate.acquire_global(0.1)
+    held = hold_slots(gw)
     r = await public.post("/v1/chat/completions", headers=auth, json=CHAT)
     assert r.status_code == 503 and r.json()["error"]["code"] == "server_busy"
     assert "Retry-After" in r.headers
@@ -131,9 +130,9 @@ async def test_server_busy_when_all_gpu_slots_taken(public, auth, gw):
     assert r.status_code == 200  # headers already sent; error arrives as an SSE event
     assert json.loads(sse_data(r.text)[-1])["error"]["code"] == "server_busy"
     assert ": ping" in r.text
-    for _ in range(gw.settings.global_concurrency):
-        gw.gate.release_global()
-    assert gw.gate.snapshot()["per_key_in_flight"] == {}
+    for ticket in held:
+        ticket.close()
+    assert scheduler_idle(gw)
 
 
 async def test_upstream_down_is_503(public, auth, gw, ollama):
@@ -142,7 +141,7 @@ async def test_upstream_down_is_503(public, auth, gw, ollama):
     assert r.status_code == 503 and r.json()["error"]["code"] == "upstream_unavailable"
     r = await public.post("/v1/chat/completions", headers=auth, json={**CHAT, "stream": True})
     assert json.loads(sse_data(r.text)[-1])["error"]["code"] == "upstream_unavailable"
-    assert gw.gate.snapshot() == {"global_limit": 2, "active": 0, "waiting": 0, "per_key_in_flight": {}}
+    assert scheduler_idle(gw)
 
 
 async def test_upstream_error_status_passes_through(public, auth, ollama):
@@ -163,10 +162,10 @@ async def test_client_disconnect_mid_stream_releases_slots_and_logs_499(gw, olla
     it = resp.body_iterator
     assert await it.__anext__() == ": connected\n\n"
     assert (await it.__anext__()).startswith("data: ")
-    assert gw.gate.active == 1
+    assert gw.scheduler.active == 1
     await it.aclose()  # what ClosingStreamingResponse does when the client goes away
 
-    assert gw.gate.snapshot() == {"global_limit": 2, "active": 0, "waiting": 0, "per_key_in_flight": {}}
+    assert scheduler_idle(gw)
     [row] = await flush_usage(gw)
     assert row["status_code"] == 499 and row["stream"] == 1
 
