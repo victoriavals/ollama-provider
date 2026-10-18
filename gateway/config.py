@@ -1,3 +1,4 @@
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -103,8 +104,8 @@ class Settings(BaseSettings):
     @field_validator("max_queue", "model_switch_after_s", "queue_timeout_s")
     @classmethod
     def _non_negative(cls, v: float) -> float:
-        if v < 0:
-            raise ValueError("must be >= 0")
+        if not math.isfinite(v) or v < 0:  # pydantic accepts nan/inf for floats
+            raise ValueError("must be a finite number >= 0")
         return v
 
     @field_validator("db_path", "log_dir")
