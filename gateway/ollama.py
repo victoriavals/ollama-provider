@@ -69,10 +69,10 @@ class OllamaClient:
                            code="model_not_found", param="model")
         resp.raise_for_status()
         body = resp.json()
+        arch = (body.get("model_info") or {}).get("general.architecture") or (body.get("details") or {}).get("family")
         info = ModelInfo(
             capabilities=frozenset(body.get("capabilities") or ["completion"]),
-            architecture=(body.get("model_info") or {}).get("general.architecture")
-            or (body.get("details") or {}).get("family"),
+            architecture=str(arch) if arch else None,
         )
         self._info[model] = (time.monotonic() + CAPS_TTL_S, info)
         return info
