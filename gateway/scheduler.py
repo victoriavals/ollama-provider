@@ -8,10 +8,12 @@ run right away:
 - a lane admits at most its capacity (resolve_capacity), all lanes together at most global_limit;
 - one model owns the GPU at a time (its "turn"). The turn stays with the model while it has
   waiters, even between requests, and passes to the model with the oldest waiter only once
-  another model is waiting AND the turn is at least switch_after_s old. The running requests
-  drain first, then the next model starts. This batches requests per model instead of
-  reloading models on every request, and no model starves;
-- at most max_queue requests wait; a waiter that is not granted within its timeout expires.
+  another model is waiting AND the turn is at least switch_after_s old (counted from the turn's
+  first request after being idle). The running requests drain first, then the next model starts.
+  This batches requests per model instead of reloading models on every request, and no model
+  starves;
+- at most max_queue requests wait; a waiter that is not granted within its timeout expires;
+- close() (shutdown) releases all waiters at once and refuses new requests.
 
 State changes only in synchronous methods on the event loop (enqueue, Ticket.close, expiry
 callbacks), each of which dispatches again, so a grant can never race with a cancellation and no
@@ -70,6 +72,10 @@ class Ticket:
         return self.lane.model
 
     @property
+    def granted(self) -> bool:
+        return self.state == GRANTED
+
+    @property
     def queue_ms(self) -> int:
         end = self.dequeued_at if self.dequeued_at is not None else self._sched.clock()
         return int((end - self.enqueued_at) * 1000)
@@ -100,13 +106,17 @@ class GpuScheduler:
         self._turn_started = 0.0
         self.active = 0
         self.waiting = 0
+        self.closed = False
         self.stats = {"granted": 0, "expired": 0, "rejected": 0, "switches": 0}
 
     def enqueue(self, model: str, capacity: int | None, timeout: float) -> Ticket | None:
-        """Queue a request for `model`; None when the queue is full.
+        """Queue a request for `model`; None when the queue is full or the scheduler is closed.
 
         capacity None keeps the lane's current capacity (global_limit for a new lane).
         """
+        if self.closed:
+            self.stats["rejected"] += 1
+            return None
         loop = asyncio.get_running_loop()
         lane = self._lanes.get(model)
         if lane is None:
@@ -126,6 +136,17 @@ class GpuScheduler:
             ticket._timer = loop.call_later(timeout, self._expire, ticket)
         return ticket
 
+    def close(self) -> None:
+        """Shutdown: refuse new requests and release every waiter at once (running ones finish).
+
+        Queued clients then get a clean 503 instead of being cancelled by the server's
+        graceful-shutdown timeout. Call it on the event loop thread.
+        """
+        self.closed = True
+        for lane in self._lanes.values():
+            for ticket in list(lane.waiters):
+                self._leave_queue(ticket, CANCELLED)
+
     def position(self, ticket: Ticket) -> int | None:
         """1-based position within the ticket's lane, None once it left the queue."""
         if ticket.state != WAITING:
@@ -142,6 +163,7 @@ class GpuScheduler:
             "global_limit": self.global_limit,
             "active": self.active,
             "waiting": self.waiting,
+            "closed": self.closed,
             "max_queue": self.max_queue,
             "switch_after_s": self.switch_after_s,
             "turn": turn,
@@ -165,6 +187,8 @@ class GpuScheduler:
             cur = self._turn
             others = [l for l in self._lanes.values() if l is not cur and l.waiters]
             if cur is not None and cur.waiters and cur.running < cur.capacity and not self._yielding(cur, now):
+                if cur.running == 0 and not others:
+                    self._turn_started = now  # idle time does not count towards the turn
                 self._grant(cur.waiters[0], now)
             elif cur is not None and cur.running > 0:
                 return  # lane full or draining for a switch; the next release dispatches again
