@@ -183,7 +183,9 @@ Notes:
 - Slot key penuh → 429 langsung.
 - Antrean penuh → 503 `server_busy` langsung (stream juga mendapat HTTP 503 asli). Menunggu > `QUEUE_TIMEOUT_S` → 503 `server_busy` (stream: event SSE error).
 - Kapasitas: `qwen3.5:4b` 1, `gemma3:4b` 4.
-- Ping stream: `: ping queue=N` (posisi di jalur model).
+- Ping stream: `: ping queue=N` (posisi di jalur model). Ping dibuang oleh ngrok (komentar SSE), tetapi koneksi tetap aman.
+- Restart/shutdown: request yang antre mendapat 503 "the server is restarting" (`Retry-After: 15`).
+- Keadilan antar key hanya lewat `max_concurrent` per key; antrean FIFO.
 - Access log: `queue_ms`.
 - `/admin/status` → `gateway.concurrency`: `lanes`, `turn`, `stats` (granted/expired/rejected/switches). Field lama `global_limit`/`active`/`waiting`/`per_key_in_flight` tetap ada.
 - Batasan: request non-stream yang client-nya putus saat antre tetap dijalankan.
