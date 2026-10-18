@@ -55,6 +55,18 @@
         </div>
         <section class="panel">
           <div class="panel-head">
+            <h3>Antrean GPU per model</h3>
+            <span id="queue-meta" class="muted"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="table" id="lanes">
+              <thead><tr><th scope="col">Model</th><th scope="col" class="num">Slot</th><th scope="col" class="num">Antre</th><th scope="col" class="num">Tunggu terlama</th><th scope="col">Status</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
             <h3>Request per jam, 24 jam terakhir</h3>
             <span id="chart-total" class="muted"></span>
           </div>
