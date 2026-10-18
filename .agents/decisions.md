@@ -1,6 +1,6 @@
 # Technical Decision Records
 
-Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#24 pada 2026-10-15 s.d. 2026-10-17 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
+Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#26 pada 2026-10-15 s.d. 2026-10-18 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
 
 ---
 
@@ -149,6 +149,8 @@ Alternative Considered: Tanpa ping (berisiko 524), tanpa usage untuk stream.
 ---
 
 ## 10. Semaphore GPU global dengan batas tunggu
+
+> **Digantikan oleh [#26](#26-scheduler-gpu-sadar-model-in-process) (2026-10-18).** Slot per key tetap; semaphore global diganti scheduler sadar-model.
 
 Date: 2026-09-27
 
@@ -401,3 +403,47 @@ Reason: VRAM adalah sumber daya paling langka di mesin ini (8 GB). Upgrade harus
 Impact: Upgrade 0.34.4 → 0.40.5 berjalan dengan downtime ~1 menit. Tidak boleh lagi `Stop-Process` langsung pada `ollama.exe` (memory.md #16).
 
 Alternative Considered: Membersihkan secara manual saat ditemukan; backup manual sebelum upgrade.
+
+---
+
+## 26. Scheduler GPU sadar-model in-process
+
+Date: 2026-10-18
+
+Context: Uji kapasitas (operations.md#kapasitas) menunjukkan tiga masalah semaphore global (#10):
+- `qwen3.5:4b` hanya berjalan 1 request sekaligus di Ollama (arsitektur `qwen35`), tetapi gateway meloloskan 4. Tiga di antaranya antre di dalam Ollama tanpa batas waktu, tidak bisa dibatalkan, dan memegang slot milik gemma.
+- Beban campuran dua model membuat Ollama bolak-balik memuat model (~4 dtk sekali muat), dan throughput turun dari ~265 ke ~41 tok/dtk.
+- Antrean menunggu 20 dtk lalu gagal, bahkan saat jelas tidak akan kebagian slot.
+
+Pemilik bertanya apakah perlu antrean dengan worker terpisah per request.
+
+Decision: `GpuScheduler` (`gateway/scheduler.py`) menggantikan semaphore global, tetap di dalam proses gateway:
+- satu jalur FIFO per model;
+- kapasitas per model: `MODEL_PARALLEL`, lalu 1 untuk `SERIAL_ARCHITECTURES` (default `qwen35`, dibaca dari `general.architecture` di `/api/show`), selain itu `GLOBAL_CONCURRENCY`;
+- satu model memegang GPU dalam satu waktu (giliran, sesuai `OLLAMA_MAX_LOADED_MODELS=1`). Giliran baru pindah bila model lain menunggu dan giliran sudah ≥ `MODEL_SWITCH_AFTER_S` (10 dtk), setelah request yang berjalan selesai;
+- `MAX_QUEUE` (32): antrean penuh langsung dibalas 503;
+- `QUEUE_TIMEOUT_S` naik 20 → 60 dtk.
+
+Request masuk antrean lewat `Ticket` yang dipegang `Finalizer`. Ping stream menyertakan posisi antrean (`: ping queue=N`), access log mendapat field `queue_ms`, dan `/admin/status` menampilkan jalur per model (`lanes`, `turn`, `stats`). Warm-up juga lewat scheduler.
+
+Reason:
+- Worker atau broker terpisah (Redis/Celery) tidak menambah kapasitas, karena GPU adalah leher botolnya dan slot Ollama sudah berperan sebagai worker.
+- Broker berarti dependency dan service baru (Redis tidak native di Windows), IPC untuk streaming token, dan pola submit-lalu-polling yang memutus kompatibilitas SDK OpenAI. Ia juga bertentangan dengan #6.
+- Dengan scheduler, semua penantian terjadi di gateway (terbatas, bisa dibatalkan, terlihat), Ollama hanya menerima yang bisa langsung dijalankan, dan request dikelompokkan per model.
+- Batas tunggu 60 dtk menutup kasus terburuk beban campuran: sisa giliran ≤ 10 dtk + menyelesaikan request berjalan ≤ ~30 dtk + muat model ~4 dtk.
+
+Impact:
+- Tidak ada perubahan schema DB, format error, maupun nama field log (hanya `queue_ms` yang ditambah).
+- `ConcurrencyGate` kini hanya mengurus slot per key.
+- Antrean penuh pada stream menjadi HTTP 503 asli (sebelumnya 200 + event error).
+- Request non-stream yang client-nya putus saat antre tetap dijalankan, karena uvicorn tidak membatalkan handler (sama seperti sebelumnya).
+- Slot per key ikut tertahan lebih lama saat antre (≤ 60 dtk), sehingga key dengan batas 2 lebih cepat mendapat `429 concurrency_limit_exceeded`.
+- Setiap upgrade Ollama: cek ulang log `does not currently support parallel requests` dan sesuaikan `SERIAL_ARCHITECTURES`.
+- Re-warm health monitor (#17) dilewati selama scheduler punya request berjalan atau antre, karena saat model berganti Ollama sesaat melaporkan "tidak ada model dimuat".
+- Hasil uji ulang (operations.md#setelah-scheduler-sadar-model-2026-10-18): 12 gemma × 1024 token 12/12 sukses (sebelumnya 8/12), 8 qwen × 512 token 8/8 sukses (sebelumnya 6/8), soak campuran 2 menit 70/70 sukses.
+
+Alternative Considered:
+- Redis/Celery atau proses worker terpisah: ditolak dengan alasan di atas.
+- Mengandalkan antrean Ollama (`OLLAMA_MAX_QUEUE`): tanpa batas waktu, tidak bisa dibatalkan, tidak terlihat, dan urutan antar model kacau.
+- Semaphore per model tanpa giliran: tetap bolak-balik memuat model pada beban campuran.
+- Mendukung `OLLAMA_MAX_LOADED_MODELS` > 1: belum perlu, karena dua model tidak muat di 8 GB.
