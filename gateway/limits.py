@@ -1,6 +1,5 @@
-"""In-memory rate limiting and GPU concurrency control (single process by design)."""
+"""In-memory rate limiting and per-key concurrency limits (single process by design)."""
 
-import asyncio
 import math
 import time
 from collections import defaultdict, deque
@@ -79,14 +78,10 @@ class FailedAuthLimiter:
 
 
 class ConcurrencyGate:
-    """Per-key in-flight cap (fail fast) plus a global GPU slot pool (bounded wait)."""
+    """Per-key in-flight cap (fail fast). GPU slots are handed out by gateway.scheduler.GpuScheduler."""
 
-    def __init__(self, global_limit: int):
-        self.global_limit = global_limit
-        self._sem = asyncio.Semaphore(global_limit)
+    def __init__(self):
         self._per_key: dict[int, int] = defaultdict(int)
-        self.active = 0
-        self.waiting = 0
 
     def try_acquire_key(self, key_id: int, limit: int) -> bool:
         if self._per_key[key_id] >= limit:
@@ -99,25 +94,5 @@ class ConcurrencyGate:
         if self._per_key[key_id] <= 0:
             del self._per_key[key_id]
 
-    async def acquire_global(self, timeout: float) -> bool:
-        self.waiting += 1
-        try:
-            await asyncio.wait_for(self._sem.acquire(), timeout)
-        except TimeoutError:
-            return False
-        finally:
-            self.waiting -= 1
-        self.active += 1
-        return True
-
-    def release_global(self) -> None:
-        self.active -= 1
-        self._sem.release()
-
     def snapshot(self) -> dict:
-        return {
-            "global_limit": self.global_limit,
-            "active": self.active,
-            "waiting": self.waiting,
-            "per_key_in_flight": dict(self._per_key),
-        }
+        return {"per_key_in_flight": dict(self._per_key)}
