@@ -5,6 +5,7 @@ num_ctx, think, ...) are dropped so a client cannot pin VRAM or blow up the cont
 """
 
 import json
+from collections.abc import Set
 from typing import Any
 
 from fastapi import Request
@@ -107,7 +108,7 @@ def _common(body: dict[str, Any], allowed: set[str], settings: Settings) -> tupl
     return payload, include_usage
 
 
-def sanitize_chat(body: dict[str, Any], caps: set[str], settings: Settings) -> tuple[dict[str, Any], bool]:
+def sanitize_chat(body: dict[str, Any], caps: Set[str], settings: Settings) -> tuple[dict[str, Any], bool]:
     if "completion" not in caps:
         raise bad(f"Model `{body['model']}` does not support chat completions.", param="model")
     messages = body.get("messages")
@@ -164,7 +165,7 @@ def sanitize_chat(body: dict[str, Any], caps: set[str], settings: Settings) -> t
     return payload, include_usage
 
 
-def sanitize_completion(body: dict[str, Any], caps: set[str], settings: Settings) -> tuple[dict[str, Any], bool]:
+def sanitize_completion(body: dict[str, Any], caps: Set[str], settings: Settings) -> tuple[dict[str, Any], bool]:
     if "completion" not in caps:
         raise bad(f"Model `{body['model']}` does not support completions.", param="model")
     if "thinking" in caps:
@@ -176,7 +177,7 @@ def sanitize_completion(body: dict[str, Any], caps: set[str], settings: Settings
     return _common(body, COMPLETION_FIELDS, settings)
 
 
-def sanitize_embeddings(body: dict[str, Any], caps: set[str], settings: Settings) -> dict[str, Any]:
+def sanitize_embeddings(body: dict[str, Any], caps: Set[str], settings: Settings) -> dict[str, Any]:
     if "embedding" not in caps:
         raise bad(f"Model `{body['model']}` does not support embeddings.", param="model",
                   code="model_not_supported")
