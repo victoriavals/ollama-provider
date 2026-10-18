@@ -1,5 +1,3 @@
-import asyncio
-
 from gateway.limits import ConcurrencyGate, FailedAuthLimiter, SlidingWindow
 
 
@@ -24,21 +22,9 @@ def test_failed_auth_limiter():
 
 
 def test_per_key_concurrency():
-    g = ConcurrencyGate(4)
+    g = ConcurrencyGate()
     assert g.try_acquire_key(1, 2) and g.try_acquire_key(1, 2)
     assert not g.try_acquire_key(1, 2)
     g.release_key(1)
     assert g.try_acquire_key(1, 2)
-
-
-async def test_global_slots_wait_then_time_out():
-    g = ConcurrencyGate(1)
-    assert await g.acquire_global(0.1)
-    assert not await g.acquire_global(0.05)
-
-    waiter = asyncio.create_task(g.acquire_global(1))
-    await asyncio.sleep(0.01)
-    assert g.waiting == 1
-    g.release_global()
-    assert await waiter
-    assert g.snapshot()["active"] == 1
+    assert g.snapshot() == {"per_key_in_flight": {1: 2}}
