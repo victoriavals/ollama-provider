@@ -88,16 +88,23 @@ class ClosingStreamingResponse(StreamingResponse):
             self._on_close()
 
 
-def server_busy(reason: str = "no GPU slot became free in time") -> APIError:
+def server_busy(reason: str = "no GPU slot became free in time", retry_after: int = 5) -> APIError:
     return APIError(503, f"Server is busy: {reason}. Please retry shortly.",
-                    type_="server_error", code="server_busy", headers={"Retry-After": "5"})
+                    type_="server_error", code="server_busy", headers={"Retry-After": str(retry_after)})
+
+
+RESTARTING = {"reason": "the server is restarting", "retry_after": 15}  # a restart takes ~2-12 s
 
 
 def _enqueue(gw: "Gateway", fin: Finalizer) -> None:
     """Take a place in the GPU queue (owned by the Finalizer); 503 at once when the queue is full."""
     fin.ticket = gw.scheduler.enqueue(fin.ctx.model, fin.ctx.gpu_capacity, gw.settings.queue_timeout_s)
     if fin.ticket is None:
-        raise server_busy("the request queue is full")
+        raise server_busy(**RESTARTING) if gw.scheduler.closed else server_busy("the request queue is full")
+
+
+def _not_granted(gw: "Gateway") -> APIError:
+    return server_busy(**RESTARTING) if gw.scheduler.closed else server_busy()
 
 
 def map_transport_error(exc: httpx.TransportError) -> APIError:
@@ -128,7 +135,7 @@ async def forward_json(gw: "Gateway", path: str, payload: dict[str, Any], ctx: R
     try:
         _enqueue(gw, fin)
         if not await fin.ticket.wait():
-            raise server_busy()
+            raise _not_granted(gw)
         try:
             resp = await gw.ollama.http.post(path, json=payload)
         except httpx.TransportError as exc:
@@ -182,7 +189,7 @@ async def _sse(gw: "Gateway", path: str, payload: dict[str, Any], include_usage:
             position = gw.scheduler.position(ticket)
             yield f": ping queue={position}\n\n" if position else ": ping\n\n"
         if not granted:
-            raise server_busy()
+            raise _not_granted(gw)
 
         async with gw.ollama.http.stream("POST", path, json=payload) as resp:
             if resp.status_code != 200:
