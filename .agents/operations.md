@@ -70,6 +70,32 @@ Gateway kini memakai `GpuScheduler` ([decisions.md #26](decisions.md#26-schedule
   - uji `OLLAMA_NUM_PARALLEL=8` untuk gemma (throughput naik hampir linear dari 1 ke 4 request, sisa VRAM ~3 GB);
   - warm-up dengan prompt yang lebih panjang.
 
+### QA antrean (2026-10-18)
+
+**Review kode independen** (agent terpisah, read-only):
+- Uji invarian acak sekitar 1,2 juta operasi (enqueue/close/expire/geser jam, 2–3 model, kapasitas 1/4) tanpa pelanggaran.
+- Probe ASGI untuk jalur disconnect yang dipakai di produksi.
+- 4 temuan ringan, semuanya sudah diperbaiki dan diberi test regresi:
+  - waktu senggang ikut dihitung sebagai umur giliran;
+  - warm-up bisa antre dan memaksa model lain gantian;
+  - slot key bisa bocor bila `resolve_capacity` gagal;
+  - NaN lolos validasi.
+- Uji mutasi: setiap perbaikan dikembalikan sementara, dan test regresinya gagal semua.
+
+**Uji live** (service produksi, key sementara yang dicabut setelahnya):
+
+| Skenario | Hasil |
+|---|---|
+| Lewat URL publik ngrok | `/health` 200, tanpa key 401, `/admin/*` 404, chat non-stream OK. Stream yang antre tetap sampai, tetapi **ngrok membuang komentar SSE** (`: connected`, `: ping`). Koneksi diam 60 dtk penuh tetap tersambung, dan 503 (non-stream) serta event error (stream) sampai di dtk ke-61 |
+| Non-stream di bawah beban (6 gemma + 6 qwen) | 12/12 sukses, qwen maks 1 berjalan, 2 kali ganti model |
+| Batas tunggu habis (3 qwen panjang di depan) | Non-stream → HTTP 503 `server_busy` di dtk ke-61; stream → event error di dtk ke-61 setelah 3 ping (`queue=1`) |
+| Antrean penuh (40 request sekaligus) | 4 berjalan, 32 antre lalu sukses, **4 langsung 503** "the request queue is full" (`Retry-After: 5`) dalam 0,24 dtk |
+| Beberapa key bersaing | Key B dan C (batas 2) masing-masing mendapat 1× 429. Request mereka menunggu ~23 dtk di belakang 12 request key A (FIFO). Keadilan hanya dijamin oleh batas per key, jadi jangan beri batas besar ke client yang tidak dipercaya |
+| Restart gateway saat ada antrean | Sebelum perbaikan: request antre terpotong (`RemoteProtocolError`, non-stream mendapat 500 teks) dan 5 traceback di log. Sesudah perbaikan: request antre langsung mendapat **503 "the server is restarting"** (`Retry-After: 15`); hanya request yang berjalan yang terpotong setelah 10 dtk (1 traceback). Restart 11,2 dtk, siap lagi di 12,3 dtk; runner Ollama tetap 1 dan tidak ada generate yatim |
+| Soak 30 menit (5 client: 35% qwen, 25% non-stream, 5% putus di tengah, jeda acak) | 664 request: **631/631 normal sukses**, 30 putus (disengaja, tercatat 499), 0 error, 0 habis waktu, 0 stream tanpa token. Tunggu p50 9,6 dtk / p95 27,9 dtk / maks 44,2 dtk. 155 kali ganti model. Memori gateway 63 → 69 MB, stabil tanpa tanda bocor. Scheduler kembali idle |
+
+Pelajaran: tunggu p50 9,6 dtk di soak terutama berasal dari pergantian model (155 × ~4 dtk ≈ sepertiga waktu). Beban campuran tetap mahal di GPU 8 GB.
+
 ## Jalur akses
 
 | Siapa | Jalur |
@@ -107,6 +133,7 @@ Gateway kini memakai `GpuScheduler` ([decisions.md #26](decisions.md#26-schedule
 | Gejala | Tindakan |
 |---|---|
 | URL publik tidak merespons | Cek `Get-Service NgrokTunnel, OllamaGateway, OllamaServe` dan `D:\ollama\logs\ngrok\`. Kemungkinan: kuota ngrok habis, authtoken dicabut, atau service mati. WinSW me-restart otomatis service yang crash |
+| `503 server_busy` "the server is restarting" | Normal saat `Restart-Service OllamaGateway`: antrean dilepas, dan client diminta mencoba lagi setelah 15 dtk (`Retry-After`). Kalau terus muncul, cek apakah service gagal start |
 | `503 upstream_unavailable` | Ollama mati atau sedang restart; WinSW menghidupkannya kembali. Cek `D:\ollama\logs\OllamaServe.err.log` |
 | `503 server_busy` | Antre > `QUEUE_TIMEOUT_S` (60 dtk), atau antrean penuh (`MAX_QUEUE` 32, langsung ditolak). Cek dashboard *Antrean GPU per model*: biasanya antrean qwen (1 slot) atau beban campuran. Arahkan beban paralel ke gemma, pertimbangkan batas per key atau `MAX_TOKENS_CAP` lebih kecil. Lihat [Kapasitas](#kapasitas) |
 | Respons lambat | Client bergantian model (muat ulang ~4 dtk, giliran per model ≥ 10 dtk), beberapa request qwen bersamaan (diproses berurutan; lihat `queue_ms` di access log), model sebagian di CPU (cek `/api/ps`), runner yatim, atau client menyalakan `reasoning_effort` |
@@ -138,7 +165,8 @@ Gateway kini memakai `GpuScheduler` ([decisions.md #26](decisions.md#26-schedule
 | Backup DB terjadwal | - | Ditolak untuk saat ini; `POST /admin/backup` tersedia |
 | Model embedding (mis. `qwen3-embedding:0.6b`) | Sesuai kebutuhan client | Belum; perlu evaluasi `OLLAMA_MAX_LOADED_MODELS` |
 | Setting `PRIMARY_MODEL` | Bila model utama berganti | Belum diperlukan |
-| Batas konkurensi per model di gateway (qwen = 1) | Agent | **Selesai 2026-10-18**: scheduler sadar-model (decisions #26) |
+| Batas konkurensi per model di gateway (qwen = 1) | Agent | **Selesai 2026-10-18**: scheduler sadar-model (decisions #26), lulus QA (lihat [QA antrean](#qa-antrean-2026-10-18)) |
+| Soak berjam-jam | Agent, saat PC tidak dipakai | Opsional; soak 30 menit sudah lulus |
 | Uji `OLLAMA_NUM_PARALLEL=8` untuk gemma | Agent, bila beban sering > 4 bersamaan | Usulan; perlu restart `OllamaServe` (downtime ~1 menit) |
 | Warm-up dengan prompt lebih panjang | Agent | Usulan kecil (kompilasi CUDA setelah update driver) |
 | Panduan singkat untuk client | Opsional | Belum |
@@ -152,4 +180,4 @@ Gateway kini memakai `GpuScheduler` ([decisions.md #26](decisions.md#26-schedule
 | 2026-10-15 | Memilih ngrok (gratis, bukan Tailscale Funnel). `CLIENT_IP_HEADERS` (entri terakhir `X-Forwarded-For`) |
 | 2026-10-16 | Audit keamanan: ACL `D:\ollama`, gateway LocalService, `image_url` hanya base64, inspector ngrok mati. `NgrokTunnel` live. Dashboard admin. `.agents/` + `CLAUDE.md`. Repo di-push publik oleh pemilik |
 | 2026-10-17 | Runner yatim dibersihkan (2,2 GB VRAM). Riset model. Ollama 0.34.4 → 0.40.5 (backup/rollback). Uji 3 model. `qwen3.5:4b` ditambahkan + kontrol `reasoning_effort`. `qwen3.5:9b` dihapus. Windows Update me-restart PC malam hari (uji reboot lulus) |
-| 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`). Pemilik bertanya soal antrean dengan worker terpisah; diputuskan scheduler GPU sadar-model in-process (`gateway/scheduler.py`, decisions #26), `QUEUE_TIMEOUT_S` 20 → 60, panel antrean di dashboard. Uji ulang: 12 gemma panjang 12/12 (sebelumnya 8/12), 8 qwen 8/8 (sebelumnya 6/8). Re-warm health monitor dilewati selama GPU sibuk |
+| 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`). Pemilik bertanya soal antrean dengan worker terpisah; diputuskan scheduler GPU sadar-model in-process (`gateway/scheduler.py`, decisions #26), `QUEUE_TIMEOUT_S` 20 → 60, panel antrean di dashboard. Uji ulang: 12 gemma panjang 12/12 (sebelumnya 8/12), 8 qwen 8/8 (sebelumnya 6/8). Re-warm health monitor dilewati selama GPU sibuk. QA menyeluruh (review kode independen, uji live 6 skenario, soak 30 menit): 4 temuan ringan diperbaiki, shutdown kini melepas antrean dengan 503 "the server is restarting", 112 test |
