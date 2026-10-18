@@ -11,7 +11,7 @@ import pytest
 from gateway import health
 from gateway.apps.public import create_public_app
 from gateway.logs import ACCESS_LOGGER, HEALTH_LOGGER, DailyFileHandler
-from tests.conftest import fixture_json, fixture_text
+from tests.conftest import fixture_json, fixture_text, hold_slots
 
 CHAT = {"model": "gemma3:4b", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -49,12 +49,14 @@ async def test_access_log_records_rejections(public, auth, access_lines):
 async def test_access_log_shows_real_outcome_of_stream(public, auth, gw, ollama, access_lines):
     ollama.post("/v1/chat/completions").respond(200, content=fixture_text("chat_stream.txt").encode())
     await public.post("/v1/chat/completions", headers=auth, json={**CHAT, "stream": True})
-    for _ in range(gw.settings.global_concurrency):
-        await gw.gate.acquire_global(0.1)
+    held = hold_slots(gw)
     await public.post("/v1/chat/completions", headers=auth, json={**CHAT, "stream": True})
     ok, busy = access_lines()
     assert (ok["status"], ok["stream"], ok["total_tokens"]) == (200, True, 22)
     assert (busy["status"], busy["error"]) == (503, "server_busy")  # HTTP header said 200
+    assert ok["queue_ms"] >= 0 and busy["queue_ms"] >= 250  # waited QUEUE_TIMEOUT_S (0.3 s)
+    for ticket in held:
+        ticket.close()
 
 
 async def test_unhandled_error_is_logged_as_internal_error(gw, auth, access_lines, monkeypatch):
@@ -154,6 +156,9 @@ async def test_rewarm_when_ollama_has_nothing_loaded(gw, monkeypatch):
     monitor._last_rewarm = 0.0
     monitor._rewarm_if_unloaded({"reachable": True, "loaded_models": [{"name": "gemma3:4b"}]})
     monitor._rewarm_if_unloaded({"reachable": False, "error": "down"})
+    held = hold_slots(gw, "qwen3.5:4b", 1)  # traffic running: "nothing loaded" is a model swap
+    monitor._rewarm_if_unloaded({"reachable": True, "loaded_models": []})
+    held[0].close()
     await asyncio.sleep(0)
     assert calls == [1]
 
