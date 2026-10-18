@@ -16,6 +16,7 @@ from .auth import ApiKey
 from .db import UsageRecord
 from .errors import APIError, error_body
 from .ollama import upstream_unavailable
+from .scheduler import Ticket
 
 if TYPE_CHECKING:
     from .core import Gateway
@@ -33,15 +34,16 @@ class RequestContext:
     started: float = field(default_factory=time.monotonic)
     rate_headers: dict[str, str] = field(default_factory=dict)
     access: dict[str, Any] = field(default_factory=dict)  # request.state.access (access-log fields)
+    gpu_capacity: int | None = None  # parallel slots of this model (scheduler.resolve_capacity)
 
 
 class Finalizer:
-    """Releases concurrency slots and records usage exactly once, however the request ends."""
+    """Releases the GPU ticket and key slot and records usage exactly once, however the request ends."""
 
     def __init__(self, gw: "Gateway", ctx: RequestContext, stream: bool):
         self.gw = gw
         self.ctx = ctx
-        self.global_held = False
+        self.ticket: Ticket | None = None
         self.record = UsageRecord(
             key_id=ctx.key.id, endpoint=ctx.endpoint, model=ctx.model, status_code=200,
             request_id=ctx.request_id, stream=stream, client_ip=ctx.client_ip,
@@ -52,8 +54,9 @@ class Finalizer:
         if self._done:
             return
         self._done = True
-        if self.global_held:
-            self.gw.gate.release_global()
+        if self.ticket is not None:
+            self.ctx.access["queue_ms"] = self.ticket.queue_ms
+            self.ticket.close()
         self.gw.gate.release_key(self.ctx.key.id)
         rec = self.record
         rec.latency_ms = int((time.monotonic() - self.ctx.started) * 1000)
@@ -85,9 +88,16 @@ class ClosingStreamingResponse(StreamingResponse):
             self._on_close()
 
 
-def server_busy() -> APIError:
-    return APIError(503, "Server is busy: all GPU slots are in use. Please retry shortly.",
+def server_busy(reason: str = "no GPU slot became free in time") -> APIError:
+    return APIError(503, f"Server is busy: {reason}. Please retry shortly.",
                     type_="server_error", code="server_busy", headers={"Retry-After": "5"})
+
+
+def _enqueue(gw: "Gateway", fin: Finalizer) -> None:
+    """Take a place in the GPU queue (owned by the Finalizer); 503 at once when the queue is full."""
+    fin.ticket = gw.scheduler.enqueue(fin.ctx.model, fin.ctx.gpu_capacity, gw.settings.queue_timeout_s)
+    if fin.ticket is None:
+        raise server_busy("the request queue is full")
 
 
 def map_transport_error(exc: httpx.TransportError) -> APIError:
@@ -116,9 +126,9 @@ def _upstream_error(raw: bytes, status: int) -> dict[str, Any]:
 async def forward_json(gw: "Gateway", path: str, payload: dict[str, Any], ctx: RequestContext) -> Response:
     fin = Finalizer(gw, ctx, stream=False)
     try:
-        if not await gw.gate.acquire_global(gw.settings.queue_timeout_s):
+        _enqueue(gw, fin)
+        if not await fin.ticket.wait():
             raise server_busy()
-        fin.global_held = True
         try:
             resp = await gw.ollama.http.post(path, json=payload)
         except httpx.TransportError as exc:
@@ -148,33 +158,31 @@ async def forward_json(gw: "Gateway", path: str, payload: dict[str, Any], ctx: R
 def stream_sse(gw: "Gateway", path: str, payload: dict[str, Any], ctx: RequestContext,
                include_usage: bool) -> Response:
     fin = Finalizer(gw, ctx, stream=True)
+    try:
+        _enqueue(gw, fin)  # before the response starts, so a full queue is a real HTTP 503
+    except APIError as exc:
+        fin.record.status_code = exc.status_code
+        exc.headers = {**ctx.rate_headers, **exc.headers}
+        fin()
+        raise
     headers = {**ctx.rate_headers, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     return ClosingStreamingResponse(_sse(gw, path, payload, include_usage, fin), on_close=fin,
                                     media_type="text/event-stream", headers=headers)
 
 
-def _release_if_acquired(gw: "Gateway") -> Callable[[asyncio.Task], None]:
-    def callback(task: asyncio.Task) -> None:
-        if not task.cancelled() and task.exception() is None and task.result():
-            gw.gate.release_global()
-    return callback
-
-
 async def _sse(gw: "Gateway", path: str, payload: dict[str, Any], include_usage: bool,
                fin: Finalizer) -> AsyncIterator[str]:
     s = gw.settings
-    acquire = asyncio.create_task(gw.gate.acquire_global(s.queue_timeout_s))
+    ticket = fin.ticket
     try:
-        # First byte goes out immediately; pings keep Cloudflare (100 s first-byte limit) happy while queued.
+        # First byte goes out immediately; pings (SSE comments, with the position in the model's
+        # queue) keep tunnels with a first-byte limit (Cloudflare: 100 s) happy while queued.
         yield ": connected\n\n"
-        while True:
-            done, _ = await asyncio.wait({acquire}, timeout=s.stream_ping_interval_s)
-            if done:
-                break
-            yield ": ping\n\n"
-        if not acquire.result():
+        while (granted := await ticket.wait(s.stream_ping_interval_s)) is None:
+            position = gw.scheduler.position(ticket)
+            yield f": ping queue={position}\n\n" if position else ": ping\n\n"
+        if not granted:
             raise server_busy()
-        fin.global_held = True
 
         async with gw.ollama.http.stream("POST", path, json=payload) as resp:
             if resp.status_code != 200:
@@ -211,11 +219,4 @@ async def _sse(gw: "Gateway", path: str, payload: dict[str, Any], include_usage:
         fin.ctx.access.setdefault("error", "client_disconnected")
         raise
     finally:
-        if not fin.global_held:
-            if acquire.done():
-                if not acquire.cancelled() and acquire.exception() is None and acquire.result():
-                    fin.global_held = True  # acquired, but the client left before we used the slot
-            else:
-                acquire.cancel()
-                acquire.add_done_callback(_release_if_acquired(gw))
-        fin()
+        fin()  # leaves the queue or frees the GPU slot, whichever applies
