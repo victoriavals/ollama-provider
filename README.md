@@ -26,10 +26,26 @@ Port 8001 (admin) dan 11434 (Ollama) tidak pernah dibuka lewat tunnel.
 - **Kapasitas** (uji beban 2026-10-18):
   - `gemma3:4b` memproses **4 request bersamaan** (`OLLAMA_NUM_PARALLEL=4` = `GLOBAL_CONCURRENCY=4`): ~69 token/detik per request, total ~265 token/detik.
   - `qwen3.5:4b` hanya **1 request sekaligus**, karena arsitekturnya belum mendukung paralel di Ollama 0.40.5: ~73 token/detik.
-  - Request lain mengantre. Yang menunggu slot lebih dari 20 detik dibalas `503 server_busy`.
+  - Request lain mengantre di gateway, di jalur per model (scheduler, lihat [Antrean GPU](#antrean-gpu)). Yang menunggu lebih dari 60 detik, atau datang saat antrean penuh (32), dibalas `503 server_busy`.
   - Setiap key default maksimal 2 request bersamaan; lebih dari itu dibalas `429`.
+  - Dengan antrean sadar-model: 12 request gemma panjang (1024 token) sekaligus semuanya selesai (sebelumnya 4 gagal), 8 request qwen sekaligus semuanya selesai (request terakhir mulai setelah ~54 detik).
+  - Memakai dua model bergantian tetap mahal (~4 detik setiap ganti model), jadi untuk beban berat sebaiknya satu model saja.
   - Detail: `.agents/operations.md` bagian Kapasitas.
 - Dari 8 GB VRAM, sekitar 2 GB dipakai desktop Windows dan aplikasi lain, sehingga ruang realistis untuk model ~6 GB. Model kelas 8–9B (bobot > 6 GB) akan tumpah ke CPU dan jauh lebih lambat; `qwen3.5:9b` hanya 87% di GPU dan 41 token/detik.
+
+### Antrean GPU
+
+Semua request generasi melewati antrean di gateway (`gateway/scheduler.py`), sehingga Ollama hanya menerima request yang bisa langsung ia kerjakan.
+
+- **Jalur per model.** Setiap model punya jalur antrean sendiri (FIFO) dengan jumlah slot sesuai kemampuannya: `gemma3:4b` 4, `qwen3.5:4b` 1.
+- **Satu model di GPU.** Hanya satu model yang berjalan pada satu waktu.
+  - Model yang sedang berjalan tetap menerima request baru selama slotnya ada.
+  - Bila model lain menunggu dan giliran sudah berjalan ≥ 10 detik, request yang berjalan diselesaikan dulu, lalu giliran pindah.
+  - Dengan begitu model tidak dimuat bolak-balik dan tidak ada model yang terus menunggu.
+- **Ping selama antre.** Request stream menerima ping `: ping queue=N` (posisi antrean) setiap 15 detik. SDK OpenAI mengabaikannya.
+- **Batas.** Antre lebih dari 60 detik, atau datang saat 32 request sudah antre, dibalas `503 server_busy`.
+- **Client putus.** Client yang memutus stream saat antre langsung keluar dari antrean.
+- **Memantau.** Antrean terlihat di dashboard (*Ringkasan → Antrean GPU per model*) dan di `scripts\status.ps1`.
 
 ## Untuk client: cara memakai API
 
@@ -109,7 +125,7 @@ Field yang diteruskan ke Ollama hanya: `model, messages, prompt, input, stream, 
 | 429 | `auth_rate_limited` | terlalu banyak auth gagal dari satu IP (diblokir 60 detik) |
 | 500 | `internal_error` | error tak terduga di gateway (detail hanya di log) |
 | 502 / 504 | `bad_gateway` / `upstream_timeout` | koneksi ke Ollama gagal / terlalu lama |
-| 503 | `server_busy` | semua slot GPU penuh > 20 detik |
+| 503 | `server_busy` | antre lebih dari 60 detik, atau antrean penuh (langsung). Coba lagi setelah `Retry-After` |
 | 503 | `upstream_unavailable` | Ollama mati (biasanya pulih sendiri dalam beberapa detik) |
 
 Pada streaming, header sudah terkirim duluan (ada ping `: ping` setiap 15 detik saat antre). Karena itu error dikirim sebagai event `data: {"error": {...}}`, dan SDK OpenAI akan me-raise-nya sebagai exception. Setiap respons membawa header `x-request-id` dan `x-ratelimit-*-requests`. Client yang memutus stream dicatat dengan status 499.
@@ -198,8 +214,8 @@ Select-String '^ADMIN_KEY=' D:\ML\ollama-provider\.env
 
 | Menu | Isi |
 |---|---|
-| Bagian atas | Lampu status Ollama / GPU / Tunnel / Disk + meter slot GPU (dipakai/antre) |
-| Ringkasan | Request, gagal, dan token hari ini; grafik request per jam (24 jam); **Cara akses** (URL publik + contoh kode, tombol salin); status semua dependency |
+| Bagian atas | Lampu status Ollama / GPU / Tunnel / Disk + meter slot GPU model yang sedang memegang GPU (dipakai/antre) |
+| Ringkasan | Request, gagal, dan token hari ini; **antrean GPU per model** (slot, antre, tunggu terlama, giliran); grafik request per jam (24 jam); **Cara akses** (URL publik + contoh kode, tombol salin); status semua dependency |
 | API key | Buat key (ditampilkan sekali), ubah batas per menit & request paralel, cabut |
 | Pemakaian | Per key / model / hari, rentang 24 jam / 7 hari / 30 hari |
 | Request | 100 request terakhir (waktu, key, model, status, token, latensi, IP), diperbarui otomatis, filter "hanya yang gagal" |
@@ -335,7 +351,10 @@ Daftar lengkap ada di `.env.example`. Yang paling sering disentuh:
 | `PUBLIC_BASE_URL` | (diisi `install-ngrok.ps1`) | URL publik yang ditampilkan di dashboard |
 | `DEFAULT_RPM` / `DEFAULT_MAX_CONCURRENT` | 60 / 2 | Batas default per key (bisa diubah per key) |
 | `GLOBAL_CONCURRENCY` | 4 | Slot GPU; samakan dengan `OLLAMA_NUM_PARALLEL` |
-| `QUEUE_TIMEOUT_S` | 20 | Lama antre sebelum `503 server_busy` |
+| `QUEUE_TIMEOUT_S` | 60 | Lama antre maksimal sebelum `503 server_busy` |
+| `MAX_QUEUE` | 32 | Jumlah request antre (semua model); lebih dari itu langsung `503` |
+| `MODEL_SWITCH_AFTER_S` | 10 | Lama minimal satu model memegang GPU sebelum gantian ke model lain yang menunggu |
+| `MODEL_PARALLEL` / `SERIAL_ARCHITECTURES` | kosong / `qwen35` | Slot paralel per model (`nama=N`) / arsitektur yang hanya 1 request sekaligus di Ollama |
 | `MAX_TOKENS_CAP` | 2048 | Batas maksimal `max_tokens` |
 | `DEFAULT_REASONING_EFFORT` | `none` | Mode berpikir default untuk model "thinking" (`none`/`medium`/`high`/kosong) |
 | `SEED_MODELS` | `gemma3:4b` | Model yang otomatis masuk allowlist saat start pertama |
@@ -354,7 +373,8 @@ Setelah mengubah `.env`, jalankan `Restart-Service OllamaGateway`. Env var milik
 | Jawaban `qwen3.5:4b` kosong (`finish_reason: length`) | Mode berpikir menghabiskan token. Pastikan `DEFAULT_REASONING_EFFORT=none`; bila client menyalakan berpikir, beri `max_tokens` besar |
 | `/v1/completions` ke qwen ditolak 400 | Disengaja (Ollama mengembalikan teks kosong untuk model berpikir); pakai `/v1/chat/completions` |
 | Request pertama lambat (~4 detik) setelah ganti model | Normal: hanya satu model muat di VRAM |
-| Respons `qwen3.5:4b` lambat atau `503 server_busy` saat ramai | qwen hanya memproses 1 request sekaligus, sisanya mengantre. Arahkan beban paralel ke `gemma3:4b` |
+| Respons `qwen3.5:4b` lambat atau `503 server_busy` saat ramai | qwen hanya memproses 1 request sekaligus, sisanya mengantre di gateway (lihat dashboard *Antrean GPU per model*). Arahkan beban paralel ke `gemma3:4b` |
+| Model baru ternyata hanya 1 request sekaligus | Log Ollama berisi `does not currently support parallel requests`. Tambahkan arsitekturnya ke `SERIAL_ARCHITECTURES` (atau `MODEL_PARALLEL=nama=1`), lalu restart gateway |
 | Request pertama sangat lambat (~15–40 detik) setelah update driver/install | Kompilasi kernel CUDA untuk akun SYSTEM, sekali per model dan ukuran prompt (cache di `C:\Windows\System32\config\systemprofile\AppData\Roaming\NVIDIA\ComputeCache`) |
 | VRAM penuh padahal hanya satu model | Runner `llama-server` yatim. `Get-Process llama-server` (harus 1); bersihkan dengan `. .\scripts\common.ps1; Remove-OrphanOllamaRunners` |
 | Model tidak 100% GPU (`/admin/status`) | Turunkan `OLLAMA_NUM_PARALLEL` / context (`install-ollama.ps1 -SkipDownload -NumParallel 2`), lalu samakan `GLOBAL_CONCURRENCY`; atau pakai model lebih kecil |
