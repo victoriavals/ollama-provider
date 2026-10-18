@@ -40,11 +40,13 @@ Semua request generasi melewati antrean di gateway (`gateway/scheduler.py`), seh
 - **Jalur per model.** Setiap model punya jalur antrean sendiri (FIFO) dengan jumlah slot sesuai kemampuannya: `gemma3:4b` 4, `qwen3.5:4b` 1.
 - **Satu model di GPU.** Hanya satu model yang berjalan pada satu waktu.
   - Model yang sedang berjalan tetap menerima request baru selama slotnya ada.
-  - Bila model lain menunggu dan giliran sudah berjalan ≥ 10 detik, request yang berjalan diselesaikan dulu, lalu giliran pindah.
+  - Bila model lain menunggu dan giliran sudah berjalan ≥ 10 detik (dihitung sejak request pertama setelah GPU senggang), request yang berjalan diselesaikan dulu, lalu giliran pindah.
   - Dengan begitu model tidak dimuat bolak-balik dan tidak ada model yang terus menunggu.
-- **Ping selama antre.** Request stream menerima ping `: ping queue=N` (posisi antrean) setiap 15 detik. SDK OpenAI mengabaikannya.
+- **Ping selama antre.** Request stream menerima ping `: ping queue=N` (posisi antrean) setiap 15 detik. SDK OpenAI mengabaikannya. **Lewat ngrok, ping ini tidak sampai ke client**, karena ngrok membuang baris komentar SSE. Client tetap menerima header 200 seketika lalu diam sampai giliran tiba. Koneksi yang diam selama 60 detik penuh sudah diuji tetap tersambung.
 - **Batas.** Antre lebih dari 60 detik, atau datang saat 32 request sudah antre, dibalas `503 server_busy`.
 - **Client putus.** Client yang memutus stream saat antre langsung keluar dari antrean.
+- **Restart gateway.** Request yang sedang antre langsung dibalas `503 server_busy` ("the server is restarting", `Retry-After: 15`). Request yang sedang berjalan diberi waktu 10 detik untuk selesai.
+- **Keadilan antar key.** Antrean berurutan (FIFO). Satu-satunya pelindung adalah batas request bersamaan per key (default 2). Key dengan batas besar bisa membuat key lain menunggu di belakangnya, jadi jangan beri batas besar ke client yang tidak dipercaya.
 - **Memantau.** Antrean terlihat di dashboard (*Ringkasan → Antrean GPU per model*) dan di `scripts\status.ps1`.
 
 ## Untuk client: cara memakai API
@@ -305,7 +307,7 @@ Select-String logs\health-*.log -Pattern WARNING                                
 | | |
 |---|---|
 | Status service | `Get-Service OllamaServe, OllamaGateway, NgrokTunnel` |
-| Deploy perubahan kode / `.env` | `Restart-Service OllamaGateway` |
+| Deploy perubahan kode / `.env` | `Restart-Service OllamaGateway` (~2 detik saat sepi, ≤ 12 detik bila ada request berjalan; request yang antre dibalas `503` dengan `Retry-After: 15`, dan SDK OpenAI otomatis mencoba lagi) |
 | Restart Ollama | `. .\scripts\common.ps1; Stop-ServiceSafe OllamaGateway; Stop-ServiceSafe OllamaServe; Start-Service OllamaServe, OllamaGateway` |
 | Upgrade Ollama / ngrok / cloudflared | `scripts\upgrade.ps1 [-Component ollama\|ngrok\|cloudflared]`. Versi lama Ollama disimpan di `D:\ollama\bin.previous`, dan otomatis dipulihkan bila versi baru gagal start |
 | Hapus service | `scripts\uninstall-services.ps1 [-IncludeNgrok] [-IncludeCloudflared]` |
