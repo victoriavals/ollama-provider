@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -15,6 +16,12 @@ log = logging.getLogger("gateway.ollama")
 CAPS_TTL_S = 600.0
 
 
+@dataclass(frozen=True)
+class ModelInfo:
+    capabilities: frozenset[str]
+    architecture: str | None  # e.g. "gemma3", "qwen35" (decides parallel slots, see scheduler.py)
+
+
 class OllamaClient:
     def __init__(self, base_url: str, connect_timeout: float, read_timeout: float,
                  transport: httpx.AsyncBaseTransport | None = None):
@@ -24,7 +31,7 @@ class OllamaClient:
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
             transport=transport,
         )
-        self._caps: dict[str, tuple[float, set[str]]] = {}
+        self._info: dict[str, tuple[float, ModelInfo]] = {}
 
     async def aclose(self) -> None:
         await self.http.aclose()
@@ -46,8 +53,11 @@ class OllamaClient:
     async def ps(self) -> list[dict[str, Any]]:
         return (await self._get("/api/ps", 10.0)).get("models", [])
 
-    async def capabilities(self, model: str) -> set[str]:
-        cached = self._caps.get(model)
+    async def capabilities(self, model: str) -> frozenset[str]:
+        return (await self.model_info(model)).capabilities
+
+    async def model_info(self, model: str) -> ModelInfo:
+        cached = self._info.get(model)
         if cached and cached[0] > time.monotonic():
             return cached[1]
         try:
@@ -58,15 +68,20 @@ class OllamaClient:
             raise APIError(404, f"The model `{model}` is enabled but not installed on this server.",
                            code="model_not_found", param="model")
         resp.raise_for_status()
-        caps = set(resp.json().get("capabilities") or ["completion"])
-        self._caps[model] = (time.monotonic() + CAPS_TTL_S, caps)
-        return caps
+        body = resp.json()
+        info = ModelInfo(
+            capabilities=frozenset(body.get("capabilities") or ["completion"]),
+            architecture=(body.get("model_info") or {}).get("general.architecture")
+            or (body.get("details") or {}).get("family"),
+        )
+        self._info[model] = (time.monotonic() + CAPS_TTL_S, info)
+        return info
 
     def invalidate(self, model: str | None = None) -> None:
         if model is None:
-            self._caps.clear()
+            self._info.clear()
         else:
-            self._caps.pop(model, None)
+            self._info.pop(model, None)
 
     async def pull(self, model: str) -> AsyncIterator[dict[str, Any]]:
         async with self.http.stream("POST", "/api/pull", json={"model": model, "stream": True},
