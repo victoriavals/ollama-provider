@@ -18,7 +18,7 @@
 | Upstream | Ollama (`http://127.0.0.1:11434`), memakai endpoint OpenAI-compat `/v1/*` dan native `/api/*` |
 | Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Ollama 0.40.5, Windows Service via **WinSW v2.12**, tunnel publik **ngrok** (gratis, aktif). Cloudflare Tunnel tersedia sebagai alternatif berbayar |
 | Package manager | `uv` (`uv.lock`) |
-| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **79 test** |
+| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **100 test** |
 | Bahasa dokumentasi | Indonesia (README, `.agents/`), komentar kode dalam Bahasa Inggris |
 
 ## Arsitektur singkat
@@ -31,7 +31,7 @@ Client --HTTPS--> ngrok edge --> ngrok agent [service NgrokTunnel]
 Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 ```
 
-- Kedua app berbagi satu objek `Gateway` (`gateway/core.py`): DB, client Ollama, rate limiter, gate konkurensi GPU, cache key, pull manager, dan health monitor.
+- Kedua app berbagi satu objek `Gateway` (`gateway/core.py`): DB, client Ollama, rate limiter, slot per key, scheduler GPU sadar-model, cache key, pull manager, dan health monitor.
 - Port 8001 dan 11434 **tidak pernah** diekspos lewat tunnel.
 - Detail lengkap: [architecture.md](architecture.md).
 
@@ -51,10 +51,10 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 
 ## Pengetahuan kritis (jebakan yang pernah terjadi)
 
-1. **Satu proses, satu worker.** Rate limit, antrean GPU, dan cache key disimpan di memori (`limits.py`, `auth.py`). Jangan menambah `--workers` atau menjalankan lebih dari satu instance di port yang sama.
+1. **Satu proses, satu worker.** Rate limit, antrean GPU, dan cache key disimpan di memori (`limits.py`, `scheduler.py`, `auth.py`). Jangan menambah `--workers` atau menjalankan lebih dari satu instance di port yang sama.
 2. **Jangan memakai `BaseHTTPMiddleware` atau `GZipMiddleware`**, karena keduanya membuffer streaming SSE. Middleware harus pure ASGI (lihat `gateway/middleware.py`).
-3. **Streaming:** header 200 dikirim segera, disusul ping `: ping` setiap 15 detik saat antre (menghindari 524 Cloudflare). Error yang terjadi setelah header terkirim dikirim sebagai `data: {"error":...}`. Status sebenarnya dicatat lewat `request.state.access["status"]`.
-4. **Slot konkurensi wajib dilepas.** Semua jalur request generasi melewati `Finalizer` (`proxy.py`), yang idempoten dan melepas slot key + slot GPU serta mencatat usage. `ClosingStreamingResponse` memastikan generator di-`aclose()` saat client putus. Endpoint generasi baru harus memakai pola yang sama.
+3. **Streaming:** header 200 dikirim segera, disusul ping `: ping queue=N` setiap 15 detik saat antre (menghindari 524 Cloudflare). Pengecualian: antrean penuh sudah ditolak sebelum header, jadi client mendapat HTTP 503 asli. Error yang terjadi setelah header terkirim dikirim sebagai `data: {"error":...}`. Status sebenarnya dicatat lewat `request.state.access["status"]`.
+4. **Slot konkurensi wajib dilepas.** Semua jalur request generasi melewati `Finalizer` (`proxy.py`), yang idempoten, memegang `Ticket` scheduler (`ticket.close()` = keluar antrean atau lepas slot GPU), melepas slot key, dan mencatat usage. `ClosingStreamingResponse` memastikan generator di-`aclose()` saat client putus. Endpoint generasi baru harus memakai pola yang sama.
 5. **Service gateway menjalankan base Python** (`C:\Program Files\Python311\python.exe -m gateway`) dengan `PYTHONPATH=<project>;<project>\.venv\Lib\site-packages`, **bukan** `.venv\Scripts\python.exe`. Launcher venv membuat proses kedua yang merusak stop/restart service. Akibatnya file `.pth` di venv tidak diproses (saat ini hanya ada `_virtualenv.pth`, tidak dibutuhkan). Service gateway berjalan sebagai **`NT AUTHORITY\LocalService`** (bukan SYSTEM), karena folder project bisa diedit akun lain (termasuk sandbox Codex). Akun di-set lewat `Win32_Service.Change` (WinSW v2 mengabaikan `<serviceaccount><username>`, dan `sc.exe config obj= ... password= ''` gagal di PS 5.1).
 6. **Wrapper service adalah WinSW, bukan NSSM.** NSSM 2.24 di Windows 11 ini macet di `STOP_PENDING` dan tidak me-restart app yang crash. Di script, hentikan service dengan `Stop-ServiceSafe` (`scripts/common.ps1`), jangan `Stop-Service -Force` (bisa menggantung).
 7. **`OllamaGateway` bergantung pada `OllamaServe`.** SCM menolak menghentikan `OllamaServe` selama gateway masih jalan, jadi hentikan gateway dulu.
@@ -69,7 +69,7 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 16. **Jangan `Stop-Process` langsung pada `ollama.exe`.** Runner anaknya (`llama-server.exe`) tertinggal sebagai proses yatim dan tetap memegang VRAM (pernah 2 runner yatim memakan ~2.2 GB). Hentikan lewat service (`Stop-ServiceSafe OllamaServe`, yang otomatis memanggil `Remove-OrphanOllamaRunners`).
 17. **Model berpikir (qwen3.5) berpikir secara default** dan bisa menghabiskan seluruh `max_tokens` sebelum menjawab (7/10 jawaban kosong di uji). Gateway menyuntik `reasoning_effort` = `DEFAULT_REASONING_EFFORT` (default `none`) untuk model ber-capability `thinking`; nilai client divalidasi (`none`/`medium`/`high`; `low` ditolak karena selalu macet sampai batas token). `/v1/completions` ditolak untuk model berpikir (Ollama mengembalikan teks kosong). Warm-up memilih model aktif pertama secara alfabet (= `gemma3:4b`).
 18. **Akses SSH pemilik lewat Tailscale bergantung pada login user "User".** Profil Tailscale terikat ke akun "User" dan *Run unattended* (ForceDaemon) tidak aktif; `AutoAdminLogon=0`. Setelah restart oleh Windows Update, "User" otomatis login (kemungkinan fitur sign-in otomatis pasca-update) sehingga Tailscale tersambung. Restart manual tidak menjamin itu, jadi bisa memutus SSH pemilik dari jauh. Jangan me-restart PC dari jauh sebelum *Run unattended* diaktifkan dari akun "User". Service API (ngrok) tetap pulih tanpa login.
-19. **`qwen3.5:4b` tidak bisa paralel di Ollama 0.40.5.** Arsitektur hibrida `qwen35` (sebagian layer rekuren) dipaksa 1 slot (log: `model architecture does not currently support parallel requests`, `n_seq_max = 1`), sedangkan `gemma3:4b` mendapat 4 slot. Gateway tetap meloloskan 4 request qwen ke Ollama: 3 antre di dalam Ollama (tidak dibatasi `QUEUE_TIMEOUT_S`) sambil memegang slot global yang sebenarnya bisa dipakai gemma. Beban campuran dua model memicu muat ulang ~4 dtk berkali-kali. Angka lengkap: [operations.md#kapasitas](operations.md#kapasitas).
+19. **`qwen3.5:4b` tidak bisa paralel di Ollama 0.40.5.** Arsitektur hibrida `qwen35` (sebagian layer rekuren) dipaksa 1 slot (log: `model architecture does not currently support parallel requests`, `n_seq_max = 1`), sedangkan `gemma3:4b` mendapat 4 slot. Gateway tetap meloloskan 4 request qwen ke Ollama: 3 antre di dalam Ollama (tidak dibatasi `QUEUE_TIMEOUT_S`) sambil memegang slot global yang sebenarnya bisa dipakai gemma. Beban campuran dua model memicu muat ulang ~4 dtk berkali-kali. **Sejak 2026-10-18 diatasi `GpuScheduler`** (`scheduler.py`, [decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)): kapasitas qwen 1 lewat `SERIAL_ARCHITECTURES=qwen35`, satu model memegang GPU per giliran, dan semua antrean terjadi di gateway. Setelah upgrade Ollama, cek ulang log tersebut. Angka lengkap: [operations.md#kapasitas](operations.md#kapasitas).
 
 ## Aturan wajib untuk AI Agent
 
@@ -97,7 +97,8 @@ Aturan operasional tambahan:
 | `gateway/apps/public.py` | Route publik `/v1/*`, alur `_generate` | Semua validasi terjadi sebelum slot diambil |
 | `gateway/apps/admin.py` | Admin API (port 8001) + audit log | |
 | `gateway/core.py` | Container `Gateway`, `PullManager`, warm-up, prune | |
-| `gateway/limits.py` | RPM, gagal-auth per IP, konkurensi per key & global | State in-memory |
+| `gateway/limits.py` | RPM, gagal-auth per IP, konkurensi per key | State in-memory |
+| `gateway/scheduler.py` | Antrean GPU sadar-model (`GpuScheduler`, `Ticket`, `resolve_capacity`) | State in-memory; ubah hanya lewat method sinkron. Ubah dengan hati-hati |
 | `gateway/sanitize.py` | Allowlist field & validasi request | Menjaga agar client tidak bisa mengubah VRAM/context |
 | `gateway/middleware.py` | Request id + access log JSON | Pure ASGI |
 | `gateway/health.py` | Health monitor dependency | |
