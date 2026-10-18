@@ -12,6 +12,7 @@ from ..errors import APIError, install_handlers
 from ..limits import RateResult
 from ..middleware import RequestContextMiddleware
 from ..proxy import RequestContext, forward_json, stream_sse
+from ..scheduler import resolve_capacity
 from ..sanitize import (
     model_not_found,
     read_json_body,
@@ -96,7 +97,8 @@ async def _generate(request: Request, key: ApiKey, endpoint: str) -> Response:
         access["model"] = model
         if not await gw.db.is_model_enabled(model):
             raise model_not_found(model)
-        caps = await gw.ollama.capabilities(model)
+        info = await gw.ollama.model_info(model)
+        caps = info.capabilities
         if sanitizer is None:
             payload, include_usage = sanitize_embeddings(body, caps, s), False
         else:
@@ -112,7 +114,8 @@ async def _generate(request: Request, key: ApiKey, endpoint: str) -> Response:
 
     # From here the key slot is owned by the proxy, which releases it when the request ends.
     ctx = RequestContext(key=key, endpoint=endpoint, model=model, request_id=request_id, client_ip=ip,
-                         rate_headers=rate.headers(), access=access)
+                         rate_headers=rate.headers(), access=access,
+                         gpu_capacity=resolve_capacity(s, model, info.architecture))
     if payload.get("stream"):
         return stream_sse(gw, path, payload, ctx, include_usage)
     return await forward_json(gw, path, payload, ctx)
