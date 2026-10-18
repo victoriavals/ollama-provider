@@ -198,11 +198,40 @@ async function loadStatus() {
     return h("li", { class: "lamp", title: comp.detail }, icon(comp.status), h("strong", {}, label), STATUS_TEXT[comp.status]);
   }));
   const g = st.gateway.concurrency;
+  // The meter follows the model that owns the GPU (qwen3.5 has 1 slot, gemma3 4).
+  const turn = g.turn && (g.lanes || []).find((l) => l.model === g.turn.model);
+  const cap = turn ? turn.capacity : g.global_limit;
+  const used = turn ? turn.running : g.active;
   const meter = h("span", { class: "meter", "aria-hidden": "true" },
-    Array.from({ length: g.global_limit }, (_, i) => h("span", { class: i < g.active ? "on" : "" })));
-  const label = `GPU ${g.active}/${g.global_limit} dipakai` + (g.waiting ? `, ${g.waiting} antre` : "");
+    Array.from({ length: cap }, (_, i) => h("span", { class: i < used ? "on" : "" })));
+  const label = `GPU ${used}/${cap} dipakai` + (turn ? ` · ${turn.model}` : "") + (g.waiting ? `, ${g.waiting} antre` : "");
   $("#slots").replaceChildren(meter, h("span", {}, label));
-  if (state.view === "overview") renderComponents(c);
+  if (state.view === "overview") {
+    renderComponents(c);
+    renderLanes(g);
+  }
+}
+const secs = (v) => `${(v || 0).toLocaleString("id-ID", { maximumFractionDigits: 1 })} dtk`;
+function laneStatus(lane, g) {
+  if (g.turn && g.turn.model === lane.model) {
+    if (lane.running && g.turn.yielding) return statusBadge("warn", "Menyelesaikan, lalu gantian");
+    return statusBadge("ok", lane.running ? "Memakai GPU" : "Giliran aktif");
+  }
+  return lane.waiting ? statusBadge("warn", "Menunggu giliran") : statusBadge("absent", "Siaga");
+}
+function renderLanes(g) {
+  const lanes = g.lanes || [];
+  $("#lanes tbody").replaceChildren(...(lanes.length ? lanes.map((l) => h("tr", {},
+    h("td", {}, l.model),
+    h("td", { class: "num" }, `${l.running}/${l.capacity}`),
+    h("td", { class: "num" }, num(l.waiting)),
+    h("td", { class: "num" }, l.waiting ? secs(l.oldest_wait_s) : "–"),
+    h("td", {}, laneStatus(l, g)))) : [h("tr", {}, h("td", { class: "empty", colspan: 5 },
+    "Belum ada request sejak gateway dijalankan"))]));
+  const st = g.stats || {};
+  $("#queue-meta").textContent = g.max_queue == null ? "" :
+    `Maks ${num(g.max_queue)} antre · gantian model setelah ${secs(g.switch_after_s)} · ` +
+    `${num(st.switches)}× ganti model, ${num(st.expired)} habis waktu, ${num(st.rejected)} ditolak`;
 }
 const COMPONENT_NAMES = { ollama: "Server Ollama", model_gpu: "Model di GPU", gpu: "Kartu grafis" };
 function componentName(key) {
