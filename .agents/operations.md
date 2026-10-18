@@ -47,10 +47,26 @@ Uji beban 2026-10-18: request stream dengan prompt bahasa Indonesia dan `max_tok
 
 VRAM tetap ~5,1 GB selama uji (cache KV dialokasikan saat model dimuat), dan utilisasi GPU ~90%.
 
-- Kapasitas nyata: **4 request bersamaan untuk gemma, 1 untuk qwen.** Antrean menampung lebih banyak selama waktu tunggunya ≤ 20 dtk. Throughput gemma ~265 tok/dtk, atau sekitar 50 jawaban 300 token per menit.
+- Kapasitas nyata: **4 request bersamaan untuk gemma, 1 untuk qwen.** Throughput gemma ~265 tok/dtk, atau sekitar 50 jawaban 300 token per menit.
 - Key pemilik memakai `max_concurrent` default (2). Naikkan lewat dashboard bila aplikasinya butuh lebih banyak request bersamaan.
-- Peluang perbaikan (belum dilakukan, perlu persetujuan pemilik):
-  - batas konkurensi per model di gateway (qwen = 1), agar request qwen antre di gateway dengan timeout dan tidak memakan slot gemma;
+
+### Setelah scheduler sadar-model (2026-10-18)
+
+Gateway kini memakai `GpuScheduler` ([decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)). Uji ulang lewat gateway, dengan `/admin/status` di-sampling setiap 0,5 dtk:
+
+| Skenario | Sebelum (semaphore global) | Sesudah (scheduler) |
+|---|---|---|
+| 8 qwen × 512 token | 6 sukses, 2 `server_busy`; 3 request antre di dalam Ollama | **8/8 sukses**. qwen tidak pernah > 1 berjalan; antrean terlihat (maks 7) dan ping memuat posisi. TTFT terakhir 54 dtk |
+| 2 gemma + 2 qwen | ~41 tok/dtk, TTFT terakhir 22 dtk; 2 request gemma tidak dijalankan bersamaan | ~56 tok/dtk, TTFT terakhir 14,8 dtk; 2 request gemma berjalan bersamaan |
+| 4 gemma + 4 qwen | ~94 tok/dtk (langsung ke Ollama), TTFT terakhir 18 dtk | ~84 tok/dtk, TTFT terakhir 20,8 dtk, 1 kali ganti model (setara) |
+| 12 gemma × 1024 token | 8 sukses, **4 `server_busy`** | **12/12 sukses** (antre maks 35 dtk, tetap di bawah batas 60 dtk) |
+| Client putus saat antre | Tidak bisa: request sudah diteruskan ke Ollama | 499, `queue_ms` 2985, request tidak pernah dikirim ke Ollama |
+| Soak 2 menit: 2 worker gemma + 2 worker qwen (128 token) | - | 70/70 sukses, 0 `server_busy`, 11 kali ganti model (~1 per 11 dtk), TTFT p50 0,1 dtk / maks 16,6 dtk, total ~70 tok/dtk |
+
+- **Beban campuran tetap mahal.** Setiap ganti model butuh ~4 dtk muat ulang; di soak, sekitar sepertiga waktu habis untuk memuat model. Untuk beban berat, sarankan client memakai satu model. `MODEL_SWITCH_AFTER_S` yang lebih besar memperjarang pergantian, dengan konsekuensi model lain menunggu lebih lama.
+- **Re-warm health monitor** sempat memuat gemma di tengah uji campuran, karena saat model berganti Ollama melaporkan "tidak ada model dimuat". Kini re-warm dilewati selama scheduler punya request berjalan atau antre.
+- **Anomali sekali, belum terjelaskan.** Satu stream qwen (07:04, saat uji disconnect) berakhir rapi di token ke-717 tanpa chunk usage dan tanpa error (access log 200, token kosong). Log Ollama mencatat `srv stop: cancel task`, satu-satunya di seluruh log. Empat percobaan ulang dengan kondisi sama berjalan normal. Pantau: cari baris access log stream berstatus 200 tanpa `completion_tokens`.
+- **Peluang perbaikan** (belum dilakukan, perlu persetujuan pemilik):
   - uji `OLLAMA_NUM_PARALLEL=8` untuk gemma (throughput naik hampir linear dari 1 ke 4 request, sisa VRAM ~3 GB);
   - warm-up dengan prompt yang lebih panjang.
 
@@ -77,10 +93,10 @@ VRAM tetap ~5,1 GB selama uji (cache KV dialokasikan saat model dimuat), dan uti
 **Menambah / mengganti model**
 1. Pull dengan `enable:false` (client tidak terpengaruh).
 2. Cek `capabilities` (`/api/show`) dan pastikan 100% GPU (`/api/ps`).
-3. Uji dengan prompt bahasa Indonesia, uji beban 4 paralel (pastikan benar-benar paralel: log Ollama tidak boleh berisi `does not currently support parallel requests`), dan perilaku mode berpikir.
+3. Uji dengan prompt bahasa Indonesia, uji beban 4 paralel, dan perilaku mode berpikir. Bila log Ollama berisi `does not currently support parallel requests` untuk model itu, tambahkan arsitekturnya (`general.architecture` dari `/api/show`) ke `SERIAL_ARCHITECTURES`, atau set `MODEL_PARALLEL=<model>=1`, lalu restart gateway.
 4. Aktifkan. Jika model **utama** berganti, warm-up masih memilih model aktif pertama secara alfabet, jadi perlu setting `PRIMARY_MODEL` (belum dibuat) atau nonaktifkan model lama dan ubah `SEED_MODELS` di `.env`.
 
-**Upgrade Ollama:** `scripts\upgrade.ps1 -Component ollama` (downtime ~1 menit, rollback otomatis). Setelahnya rekam ulang respons OpenAI-compat dan bandingkan dengan `tests/fixtures/`, jalankan `uv run pytest`, lalu smoke test lewat URL publik dengan key sementara (cabut setelahnya).
+**Upgrade Ollama:** `scripts\upgrade.ps1 -Component ollama` (downtime ~1 menit, rollback otomatis). Setelahnya rekam ulang respons OpenAI-compat dan bandingkan dengan `tests/fixtures/`, cek ulang log `does not currently support parallel requests` (sesuaikan `SERIAL_ARCHITECTURES` bila daftar arsitekturnya berubah), jalankan `uv run pytest`, lalu smoke test lewat URL publik dengan key sementara (cabut setelahnya).
 
 **Cek harian:** `scripts\status.ps1`, atau dashboard *Ringkasan*. Health monitor mencatat setiap perubahan status ke `logs\health-*.log`.
 
@@ -92,8 +108,8 @@ VRAM tetap ~5,1 GB selama uji (cache KV dialokasikan saat model dimuat), dan uti
 |---|---|
 | URL publik tidak merespons | Cek `Get-Service NgrokTunnel, OllamaGateway, OllamaServe` dan `D:\ollama\logs\ngrok\`. Kemungkinan: kuota ngrok habis, authtoken dicabut, atau service mati. WinSW me-restart otomatis service yang crash |
 | `503 upstream_unavailable` | Ollama mati atau sedang restart; WinSW menghidupkannya kembali. Cek `D:\ollama\logs\OllamaServe.err.log` |
-| `503 server_busy` | Keempat slot GPU penuh > 20 dtk, atau antrean qwen (hanya 1 request sekaligus). Beban tinggi: arahkan beban paralel ke gemma, pertimbangkan batas per key atau `MAX_TOKENS_CAP` lebih kecil. Lihat [Kapasitas](#kapasitas) |
-| Respons lambat | Client bergantian model (muat ulang ~4 dtk), beberapa request qwen bersamaan (diproses berurutan), model sebagian di CPU (cek `/api/ps`), runner yatim, atau client menyalakan `reasoning_effort` |
+| `503 server_busy` | Antre > `QUEUE_TIMEOUT_S` (60 dtk), atau antrean penuh (`MAX_QUEUE` 32, langsung ditolak). Cek dashboard *Antrean GPU per model*: biasanya antrean qwen (1 slot) atau beban campuran. Arahkan beban paralel ke gemma, pertimbangkan batas per key atau `MAX_TOKENS_CAP` lebih kecil. Lihat [Kapasitas](#kapasitas) |
+| Respons lambat | Client bergantian model (muat ulang ~4 dtk, giliran per model ≥ 10 dtk), beberapa request qwen bersamaan (diproses berurutan; lihat `queue_ms` di access log), model sebagian di CPU (cek `/api/ps`), runner yatim, atau client menyalakan `reasoning_effort` |
 | Jawaban qwen kosong | Mode berpikir menghabiskan token. Pastikan `DEFAULT_REASONING_EFFORT=none` |
 | Banyak 401 dari satu IP | `FailedAuthLimiter` otomatis memblokir (429) selama 60 dtk. Cek `ip` di access log |
 | API key client bocor | Cabut di dashboard, buat key baru untuk client itu |
@@ -122,7 +138,7 @@ VRAM tetap ~5,1 GB selama uji (cache KV dialokasikan saat model dimuat), dan uti
 | Backup DB terjadwal | - | Ditolak untuk saat ini; `POST /admin/backup` tersedia |
 | Model embedding (mis. `qwen3-embedding:0.6b`) | Sesuai kebutuhan client | Belum; perlu evaluasi `OLLAMA_MAX_LOADED_MODELS` |
 | Setting `PRIMARY_MODEL` | Bila model utama berganti | Belum diperlukan |
-| Batas konkurensi per model di gateway (qwen = 1) | Agent, bila pemilik setuju | Usulan dari uji kapasitas 2026-10-18 |
+| Batas konkurensi per model di gateway (qwen = 1) | Agent | **Selesai 2026-10-18**: scheduler sadar-model (decisions #26) |
 | Uji `OLLAMA_NUM_PARALLEL=8` untuk gemma | Agent, bila beban sering > 4 bersamaan | Usulan; perlu restart `OllamaServe` (downtime ~1 menit) |
 | Warm-up dengan prompt lebih panjang | Agent | Usulan kecil (kompilasi CUDA setelah update driver) |
 | Panduan singkat untuk client | Opsional | Belum |
@@ -136,4 +152,4 @@ VRAM tetap ~5,1 GB selama uji (cache KV dialokasikan saat model dimuat), dan uti
 | 2026-10-15 | Memilih ngrok (gratis, bukan Tailscale Funnel). `CLIENT_IP_HEADERS` (entri terakhir `X-Forwarded-For`) |
 | 2026-10-16 | Audit keamanan: ACL `D:\ollama`, gateway LocalService, `image_url` hanya base64, inspector ngrok mati. `NgrokTunnel` live. Dashboard admin. `.agents/` + `CLAUDE.md`. Repo di-push publik oleh pemilik |
 | 2026-10-17 | Runner yatim dibersihkan (2,2 GB VRAM). Riset model. Ollama 0.34.4 → 0.40.5 (backup/rollback). Uji 3 model. `qwen3.5:4b` ditambahkan + kontrol `reasoning_effort`. `qwen3.5:9b` dihapus. Windows Update me-restart PC malam hari (uji reboot lulus) |
-| 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`) |
+| 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`). Pemilik bertanya soal antrean dengan worker terpisah; diputuskan scheduler GPU sadar-model in-process (`gateway/scheduler.py`, decisions #26), `QUEUE_TIMEOUT_S` 20 → 60, panel antrean di dashboard. Uji ulang: 12 gemma panjang 12/12 (sebelumnya 8/12), 8 qwen 8/8 (sebelumnya 6/8). Re-warm health monitor dilewati selama GPU sibuk |
