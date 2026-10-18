@@ -44,8 +44,13 @@ async def main() -> None:
         _Server(uvicorn.Config(create_admin_app(gw), port=settings.admin_port, **common)),
     ]
 
+    loop = asyncio.get_running_loop()
+
     def stop(*_):
         log.info("shutdown requested")
+        # Release queued requests with a clean 503 now; running ones get timeout_graceful_shutdown.
+        # Via the loop, because a signal handler may interrupt a scheduler state change.
+        loop.call_soon_threadsafe(gw.scheduler.close)
         for s in servers:
             if s.should_exit:
                 s.force_exit = True
