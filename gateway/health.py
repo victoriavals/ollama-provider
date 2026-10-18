@@ -164,7 +164,7 @@ class HealthMonitor:
             "disks": disks,
             "gateway": {
                 "uptime_s": int(time.time() - self.gw.started_at),
-                "concurrency": self.gw.gate.snapshot(),
+                "concurrency": {**self.gw.scheduler.snapshot(), **self.gw.gate.snapshot()},
                 "pull_jobs_running": self.gw.pulls.running(),
             },
         }
@@ -221,6 +221,9 @@ class HealthMonitor:
     def _rewarm_if_unloaded(self, ollama: dict[str, Any]) -> None:
         """After an Ollama restart (crash, upgrade) nothing is loaded; reload before clients pay for it."""
         if not (self.gw.settings.warmup and ollama["reachable"]) or ollama["loaded_models"]:
+            return
+        # With requests running or queued, "nothing loaded" is just a model swap in progress.
+        if self.gw.scheduler.active or self.gw.scheduler.waiting:
             return
         if time.monotonic() - self._last_rewarm < REWARM_MIN_INTERVAL_S:
             return
