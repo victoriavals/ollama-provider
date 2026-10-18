@@ -17,8 +17,11 @@ ADMIN_KEY = "admin-test-key"
 
 CAPS = {
     "gemma3:4b": ["completion", "vision"],
+    "qwen3.5:4b": ["completion", "vision", "tools", "thinking"],
     "nomic-embed-text": ["embedding"],
 }
+# /api/show model_info["general.architecture"]; qwen35 runs one request at a time in Ollama
+ARCH = {"gemma3:4b": "gemma3", "qwen3.5:4b": "qwen35", "nomic-embed-text": "nomic-bert"}
 
 
 def fixture_text(name: str) -> str:
@@ -33,7 +36,8 @@ def _show(request: httpx.Request) -> httpx.Response:
     model = json.loads(request.content)["model"]
     if model not in CAPS:
         return httpx.Response(404, json={"error": f"model '{model}' not found"})
-    return httpx.Response(200, json={"capabilities": CAPS[model]})
+    return httpx.Response(200, json={"capabilities": CAPS[model],
+                                     "model_info": {"general.architecture": ARCH[model]}})
 
 
 @pytest.fixture
@@ -105,6 +109,18 @@ async def api_key(gw) -> str:
 @pytest.fixture
 def auth(api_key) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
+
+
+def hold_slots(gw: Gateway, model: str = "gemma3:4b", n: int | None = None) -> list:
+    """Occupy n GPU slots (default: all) for `model`; close() the returned tickets to free them."""
+    n = gw.settings.global_concurrency if n is None else n
+    tickets = [gw.scheduler.enqueue(model, None, 1.0) for _ in range(n)]
+    assert all(t is not None and t.state == "granted" for t in tickets)
+    return tickets
+
+
+def scheduler_idle(gw: Gateway) -> bool:
+    return (gw.scheduler.active, gw.scheduler.waiting, gw.gate.snapshot()["per_key_in_flight"]) == (0, 0, {})
 
 
 async def flush_usage(gw: Gateway) -> list[dict]:
