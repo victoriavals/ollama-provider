@@ -97,7 +97,7 @@ data/  logs/        runtime, gitignored, jangan di-commit
 
 ## Testing rules
 
-- `uv run pytest` harus hijau (saat ini 100 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
+- `uv run pytest` harus hijau (saat ini 112 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
 - Ollama selalu di-mock: fixture `ollama` (respx `MockRouter`) dipasang ke `Gateway(..., ollama_transport=httpx.MockTransport(router.async_handler))`.
 - Gunakan fixture: `gw`, `public`, `admin`, `api_key`, `auth`, helper `new_key()` dan `flush_usage()` (`tests/conftest.py`).
 - Setting test via `make_settings()`: `health_interval_s=0`, `watch_services=""`, `log_dir=tmp_path/"logs"`, `warmup=False`. Test tidak boleh menyentuh service, GPU, atau jaringan sungguhan (kecuali `test_service_states_on_windows`, yang di-skip di non-Windows).
