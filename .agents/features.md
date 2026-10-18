@@ -15,7 +15,7 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Tools / function calling passthrough | Completed (kondisional, belum bisa diuji: gemma3 tanpa `tools`) |
 | API key auth | Completed (diuji live) |
 | Rate limit per key (RPM) | Completed (diuji live) |
-| Kontrol konkurensi (per key + antrean GPU) | Completed (diuji live) |
+| Kontrol konkurensi (per key + antrean GPU sadar-model) | Completed (scheduler 2026-10-18, diuji live) |
 | Limit gagal-auth per IP | Completed |
 | Sanitasi request | Completed (diuji live) |
 | Usage logging ke DB | Completed (diuji live) |
@@ -81,7 +81,7 @@ Important Files: `sanitize.py`, `tests/test_sanitize.py`, `tests/fixtures/chat_s
 
 Dependencies: Ollama ≥ 0.40.5 (format OpenAI-compat dengan field `reasoning`), capability `thinking` dari `/api/show`
 
-Notes: Hasil uji perbandingan (10 prompt Indonesia): gemma3:4b paling natural; qwen3.5:4b unggul di tools/format tapi lebih lemah di fakta & nuansa bahasa; qwen3.5:9b paling akurat tapi 87% GPU dan 2× lebih lambat, sehingga dihapus. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default). Ollama 0.40.5 hanya menjalankan **1 request qwen sekaligus** (arsitektur `qwen35`), lihat [operations.md#kapasitas](operations.md#kapasitas).
+Notes: Hasil uji perbandingan (10 prompt Indonesia): gemma3:4b paling natural; qwen3.5:4b unggul di tools/format tapi lebih lemah di fakta & nuansa bahasa; qwen3.5:9b paling akurat tapi 87% GPU dan 2× lebih lambat, sehingga dihapus. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default). Ollama 0.40.5 hanya menjalankan **1 request qwen sekaligus** (arsitektur `qwen35`); sejak 2026-10-18 scheduler gateway menegakkan batas ini sehingga antrean qwen terjadi di gateway, bukan di Ollama. Lihat [operations.md#kapasitas](operations.md#kapasitas).
 
 ## Embeddings
 
@@ -167,19 +167,26 @@ Dependencies: `DEFAULT_RPM` (60) atau `api_keys.rpm_limit`
 
 Notes: Sliding window 60 dtk, in-memory (reset saat restart). Header `x-ratelimit-*-requests`. Hanya POST generasi yang dihitung.
 
-## Kontrol Konkurensi & Antrean GPU
+## Kontrol Konkurensi & Antrean GPU (scheduler sadar-model)
 
-Purpose: Mencegah GPU kelebihan beban dan membagi slot secara adil.
+Purpose: Mencegah GPU kelebihan beban, membagi slot secara adil, dan memastikan Ollama hanya menerima request yang bisa langsung ia jalankan. Model dikelompokkan per giliran agar tidak bolak-balik dimuat.
 
-Status: Completed (diuji live: puncak 2 aktif / 3 menunggu dengan limit 2).
+Status: Completed. Slot per key sejak 2026-09-27; scheduler sadar-model sejak 2026-10-18 (menggantikan semaphore global, [decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)). Diuji live, hasilnya di [operations.md#kapasitas](operations.md#kapasitas).
 
-Location: `gateway/limits.py` (`ConcurrencyGate`), `gateway/proxy.py`
+Location: `gateway/scheduler.py` (`GpuScheduler`, `Ticket`, `resolve_capacity`), `gateway/limits.py` (`ConcurrencyGate`, per key), `gateway/proxy.py` (`Finalizer` memegang ticket), `gateway/apps/public.py` (kapasitas dari arsitektur model), panel *Antrean GPU per model* di dashboard, baris `queue` di `status.ps1`
 
-Important Files: `limits.py`, `proxy.py`
+Important Files: `scheduler.py`, `limits.py`, `proxy.py`, `tests/test_scheduler.py`
 
-Dependencies: `GLOBAL_CONCURRENCY` (= `OLLAMA_NUM_PARALLEL` = 4), `QUEUE_TIMEOUT_S` (20), `DEFAULT_MAX_CONCURRENT` (2)
+Dependencies: `GLOBAL_CONCURRENCY` (= `OLLAMA_NUM_PARALLEL` = 4), `QUEUE_TIMEOUT_S` (60), `MAX_QUEUE` (32), `MODEL_SWITCH_AFTER_S` (10), `MODEL_PARALLEL` (kosong), `SERIAL_ARCHITECTURES` (`qwen35`), `DEFAULT_MAX_CONCURRENT` (2); `OLLAMA_MAX_LOADED_MODELS=1`
 
-Notes: Slot key penuh → 429 langsung. Slot global penuh > 20 dtk → 503 `server_busy`. Gateway belum membatasi per model, padahal `qwen3.5:4b` hanya punya 1 slot di Ollama. Hasil uji kapasitas: [operations.md#kapasitas](operations.md#kapasitas).
+Notes:
+- Slot key penuh → 429 langsung.
+- Antrean penuh → 503 `server_busy` langsung (stream juga mendapat HTTP 503 asli). Menunggu > `QUEUE_TIMEOUT_S` → 503 `server_busy` (stream: event SSE error).
+- Kapasitas: `qwen3.5:4b` 1, `gemma3:4b` 4.
+- Ping stream: `: ping queue=N` (posisi di jalur model).
+- Access log: `queue_ms`.
+- `/admin/status` → `gateway.concurrency`: `lanes`, `turn`, `stats` (granted/expired/rejected/switches). Field lama `global_limit`/`active`/`waiting`/`per_key_in_flight` tetap ada.
+- Batasan: request non-stream yang client-nya putus saat antre tetap dijalankan.
 
 ## Limit Gagal-Auth per IP
 
