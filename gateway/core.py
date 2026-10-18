@@ -14,6 +14,7 @@ from .db import Database, UsageWriter, utcnow
 from .health import HealthMonitor
 from .limits import ConcurrencyGate, FailedAuthLimiter, SlidingWindow
 from .ollama import OllamaClient
+from .scheduler import GpuScheduler
 
 log = logging.getLogger("gateway")
 
@@ -29,7 +30,9 @@ class Gateway:
                                    settings.upstream_read_timeout, transport=ollama_transport)
         self.rpm = SlidingWindow(60.0)
         self.failed_auth = FailedAuthLimiter(settings.failed_auth_per_ip_per_min)
-        self.gate = ConcurrencyGate(settings.global_concurrency)
+        self.gate = ConcurrencyGate()
+        self.scheduler = GpuScheduler(settings.global_concurrency, settings.max_queue,
+                                      settings.model_switch_after_s)
         self.keys = KeyCache()
         self.pulls = PullManager(self)
         self.health = HealthMonitor(self)
@@ -86,10 +89,19 @@ class Gateway:
         models = await self.db.enabled_models()
         if not models:
             return
+        name = models[0]["name"]
+        # Through the scheduler, so a warm-up never swaps models under running requests.
+        ticket = self.scheduler.enqueue(name, None, self.settings.queue_timeout_s)
         try:
-            await self.ollama.warmup(models[0]["name"])
+            if ticket is None or not await ticket.wait():
+                log.info("warm-up of %s skipped: GPU queue is busy", name)
+                return
+            await self.ollama.warmup(name)
         except Exception as exc:
-            log.warning("warm-up of %s failed: %r", models[0]["name"], exc)
+            log.warning("warm-up of %s failed: %r", name, exc)
+        finally:
+            if ticket is not None:
+                ticket.close()
 
 
 class PullManager:
