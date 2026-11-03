@@ -96,6 +96,26 @@ Gateway kini memakai `GpuScheduler` ([decisions.md #26](decisions.md#26-schedule
 
 Pelajaran: tunggu p50 9,6 dtk di soak terutama berasal dari pergantian model (155 × ~4 dtk ≈ sepertiga waktu). Beban campuran tetap mahal di GPU 8 GB.
 
+### Kebijakan per key: uji live (2026-10-18)
+
+Setelah deploy [decisions.md #27](decisions.md#27-kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas):
+- DB sudah di-backup ke `data/backups/gateway-20261018-133759.db`, lalu migrasi menambah 5 kolom.
+- Key pemilik tetap tanpa batas / semua model / prioritas 0.
+- Semua key uji dicabut setelahnya.
+
+| Skenario | Hasil |
+|---|---|
+| Kuota 60 token/hari | 200 (sisa 60) → 200 (sisa 28; 32 token per request) → **429 `insufficient_quota`**, `Retry-After` = detik sampai 00:00 WIB, `x-should-retry: false`. Dashboard menampilkan 64 token hari ini |
+| Key kedaluwarsa | 401 `api_key_expired`; daftar key menandai `expired` |
+| Model per key (`gemma3:4b` saja) | `/v1/models` hanya berisi gemma; request qwen → 404 `model_not_found` |
+| Banjir: key A 12 request gemma × 512 token; key B (batas 2) dan key P (prioritas) datang belakangan | P dan B dilayani di gelombang berikutnya (TTFT 7,9 / 8,9 dtk). **Sebelumnya B menunggu ~23 dtk** di belakang seluruh antrean A |
+| Setelah slot cadangan ([decisions #28](decisions.md#28-jalur-cepat-key-prioritas-slot-cadangan-dan-gantian-model-seketika)): banjir 10 request gemma × 512, lalu request prioritas di dtk 1 | Request biasa berjalan dalam gelombang 3 (bukan 4). Request prioritas mulai **0,1 dtk** setelah dikirim |
+| Giliran qwen ditahan aliran request qwen pendek; request gemma datang di dtk 1 | Key biasa mulai di dtk 14,7 (10 dtk giliran + menyelesaikan request + muat model); **key prioritas di dtk 5,8**. Run pertama sempat 31,5 dtk karena Ollama tersendat (`GPU discovery watchdog timed out`, muat qwen 12 dtk); jarang terjadi |
+| 40 request biasa sekaligus, lalu prioritas | 5 request biasa ditolak (antrean penuh); request prioritas tetap dilayani |
+| Lewat URL publik ngrok | Header `x-quota-tokens-{day,month}-{limit,remaining}` sampai ke client |
+
+Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. Label `.sr-only` ("Aksi") ternyata membuat halaman ponsel bisa digeser ke samping, sehingga `.table-wrap` kini `position: relative`. Dialog memakai kolom `minmax(0, 1fr)` agar teks panjang tidak melebarkannya.
+
 ## Jalur akses
 
 | Siapa | Jalur |
@@ -110,11 +130,17 @@ Pelajaran: tunggu p50 9,6 dtk di soak terutama berasal dari pergantian model (15
 ## Runbook
 
 **Memberi akses client baru**
-1. Dashboard → *API key* → *Buat key* (nama client, batas opsional), atau `gateway.cli create-key --name <client>`. Key hanya tampil sekali.
-2. Berikan ke client: `PUBLIC_BASE_URL`, key, dan panduan model: `gemma3:4b` untuk percakapan (default), `qwen3.5:4b` untuk tools/JSON (tanpa `/v1/completions`).
-3. Pantau di dashboard (*Pemakaian*, *Request*) atau `logs\access-*.log`.
+1. Dashboard → *API key* → *Buat key*. Isi nama client dan batas opsional. Di *Batas lanjutan* atur kuota token harian/bulanan, masa berlaku, model yang boleh dipakai, dan prioritas. Atau pakai `gateway.cli create-key --name <client> [--daily-tokens N --monthly-tokens N --expires YYYY-MM-DD --models a,b --priority 1]`. Key hanya tampil sekali.
+2. Salin **pesan untuk client** dari dialog. Pesan itu sudah berisi URL, key, model, batas, kuota, masa berlaku, contoh kode, dan tautan `CLIENT.md` bila `CLIENT_GUIDE_URL` diisi. Kirim lewat jalur pribadi. Tombol *Pesan* di tabel menyalin ulang versi tanpa key.
+3. Pantau di dashboard: kolom *Kuota token* dan status *Kuota habis* / *Kedaluwarsa*, menu *Pemakaian* dan *Request*. Bisa juga lewat `logs\access-*.log`.
+4. Untuk client yang tidak dipercaya, jangan menaikkan `max_concurrent` dan jangan memberi *prioritas*.
 
 **Mencabut client:** dashboard → *Cabut* (langsung berlaku). Lewat CLI, perubahan berlaku ≤ 30 dtk.
+
+**Memeriksa siapa memakai AI untuk apa** (log prompt, decisions #29):
+1. Dashboard → *Prompt*. Pilih rentang waktu (default 24 jam), lalu filter key, model, status, atau cari teks (≥ 3 huruf). Klik *Lihat* untuk isi lengkap, termasuk IP, field `user`, dan request ID.
+2. Mencurigakan? Cocokkan IP dan waktunya di `logs\access-*.log`, lalu *Cabut* key-nya dan buat key baru untuk client yang sah.
+3. Prompt key milikmu sendiri juga tercatat, kecuali opsi *Catat prompt & jawaban* di key itu dimatikan.
 
 **Menambah / mengganti model**
 1. Pull dengan `enable:false` (client tidak terpengaruh).
@@ -139,7 +165,8 @@ Pelajaran: tunggu p50 9,6 dtk di soak terutama berasal dari pergantian model (15
 | Respons lambat | Client bergantian model (muat ulang ~4 dtk, giliran per model ≥ 10 dtk), beberapa request qwen bersamaan (diproses berurutan; lihat `queue_ms` di access log), model sebagian di CPU (cek `/api/ps`), runner yatim, atau client menyalakan `reasoning_effort` |
 | Jawaban qwen kosong | Mode berpikir menghabiskan token. Pastikan `DEFAULT_REASONING_EFFORT=none` |
 | Banyak 401 dari satu IP | `FailedAuthLimiter` otomatis memblokir (429) selama 60 dtk. Cek `ip` di access log |
-| API key client bocor | Cabut di dashboard, buat key baru untuk client itu |
+| API key client bocor | Cabut di dashboard, buat key baru untuk client itu. Menu *Prompt* menunjukkan IP dan isi pemakaian sejak bocor |
+| Ada prompt aneh / penyalahgunaan | Dashboard → *Prompt*, filter key + rentang, lihat IP/`user`. Cabut key atau minta client memblokir `user` tersebut |
 | Authtoken ngrok bocor | Reset di dashboard ngrok, lalu jalankan ulang `install-ngrok.ps1` dengan token baru |
 | Disk hampir penuh (health `warn`) | Hapus model tak terpakai lewat dashboard. Log terhapus otomatis setelah 30 hari, usage DB setelah 90 hari |
 | GPU panas (health `warn` ≥ 85 °C) | Cek beban dan pendinginan; health monitor mencatat transisinya |
@@ -169,7 +196,7 @@ Pelajaran: tunggu p50 9,6 dtk di soak terutama berasal dari pergantian model (15
 | Soak berjam-jam | Agent, saat PC tidak dipakai | Opsional; soak 30 menit sudah lulus |
 | Uji `OLLAMA_NUM_PARALLEL=8` untuk gemma | Agent, bila beban sering > 4 bersamaan | Usulan; perlu restart `OllamaServe` (downtime ~1 menit) |
 | Warm-up dengan prompt lebih panjang | Agent | Usulan kecil (kompilasi CUDA setelah update driver) |
-| Panduan singkat untuk client | Opsional | Belum |
+| Panduan singkat untuk client | Agent | **Selesai 2026-10-18**: `CLIENT.md` + pesan siap kirim di dashboard |
 | Uji `scripts\uninstall-services.ps1` | - | Belum pernah dijalankan |
 
 ## Riwayat perubahan
@@ -180,4 +207,5 @@ Pelajaran: tunggu p50 9,6 dtk di soak terutama berasal dari pergantian model (15
 | 2026-10-15 | Memilih ngrok (gratis, bukan Tailscale Funnel). `CLIENT_IP_HEADERS` (entri terakhir `X-Forwarded-For`) |
 | 2026-10-16 | Audit keamanan: ACL `D:\ollama`, gateway LocalService, `image_url` hanya base64, inspector ngrok mati. `NgrokTunnel` live. Dashboard admin. `.agents/` + `CLAUDE.md`. Repo di-push publik oleh pemilik |
 | 2026-10-17 | Runner yatim dibersihkan (2,2 GB VRAM). Riset model. Ollama 0.34.4 → 0.40.5 (backup/rollback). Uji 3 model. `qwen3.5:4b` ditambahkan + kontrol `reasoning_effort`. `qwen3.5:9b` dihapus. Windows Update me-restart PC malam hari (uji reboot lulus) |
-| 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`). Pemilik bertanya soal antrean dengan worker terpisah; diputuskan scheduler GPU sadar-model in-process (`gateway/scheduler.py`, decisions #26), `QUEUE_TIMEOUT_S` 20 → 60, panel antrean di dashboard. Uji ulang: 12 gemma panjang 12/12 (sebelumnya 8/12), 8 qwen 8/8 (sebelumnya 6/8). Re-warm health monitor dilewati selama GPU sibuk. QA menyeluruh (review kode independen, uji live 6 skenario, soak 30 menit): 4 temuan ringan diperbaiki, shutdown kini melepas antrean dengan 503 "the server is restarting", 112 test |
+| 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`). Pemilik bertanya soal antrean dengan worker terpisah; diputuskan scheduler GPU sadar-model in-process (`gateway/scheduler.py`, decisions #26), `QUEUE_TIMEOUT_S` 20 → 60, panel antrean di dashboard. Uji ulang: 12 gemma panjang 12/12 (sebelumnya 8/12), 8 qwen 8/8 (sebelumnya 6/8). Re-warm health monitor dilewati selama GPU sibuk. QA menyeluruh (review kode independen, uji live 6 skenario, soak 30 menit): 4 temuan ringan diperbaiki, shutdown kini melepas antrean dengan 503 "the server is restarting", 112 test. Kebijakan per key (decisions #27): kuota token harian/bulanan, masa berlaku, model per key, prioritas, antrean adil per key, `CLIENT.md` + pesan siap kirim di dashboard, migrasi DB aditif pertama; uji live lulus, 127 test. Atas permintaan pemilik, key `naufalnaufal` dibuat tanpa batas dan prioritas 9, lalu jalur cepat prioritas (decisions #28): slot cadangan, bebas antrean penuh, gantian model seketika; 131 test |
+| 2026-11-03 | Log prompt & jawaban untuk audit (decisions #29): tabel `prompt_logs`, per key `log_prompts`, retensi 30 hari, menu *Prompt* di dashboard (rentang waktu wajib, 50 baris per halaman, cuplikan + detail on-demand), `CLIENT.md#privasi` diperbarui; 142 test |
