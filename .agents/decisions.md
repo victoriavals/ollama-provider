@@ -1,6 +1,6 @@
 # Technical Decision Records
 
-Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#26 pada 2026-10-15 s.d. 2026-10-18 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
+Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#29 pada 2026-10-15 s.d. 2026-11-03 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
 
 ---
 
@@ -454,3 +454,135 @@ Alternative Considered:
 - Mengandalkan antrean Ollama (`OLLAMA_MAX_QUEUE`): tanpa batas waktu, tidak bisa dibatalkan, tidak terlihat, dan urutan antar model kacau.
 - Semaphore per model tanpa giliran: tetap bolak-balik memuat model pada beban campuran.
 - Mendukung `OLLAMA_MAX_LOADED_MODELS` > 1: belum perlu, karena dua model tidak muat di 8 GB.
+
+---
+
+## 27. Kebijakan per key: kuota token, masa berlaku, model, prioritas
+
+Date: 2026-10-18
+
+Context: Pemilik ingin membagikan API ke client lain. Sebelumnya key hanya dibatasi RPM dan jumlah request paralel. QA #26 juga menunjukkan antrean FIFO membuat key berbatas kecil menunggu ~23 dtk di belakang key yang membanjiri request. Keputusan pemilik:
+- kuota total token harian + bulanan (opsional per key), reset WIB;
+- panduan `CLIENT.md` + pesan siap kirim di dashboard;
+- antrean adil per key dengan tanda prioritas.
+
+Decision:
+- **Kolom baru di `api_keys`:** `daily_token_limit`, `monthly_token_limit`, `expires_at`, `allowed_models` (JSON), `priority`. Kolom ditambahkan lewat migrasi aditif pertama project ini (`KEY_MIGRATIONS` + `PRAGMA table_info` di `Database.connect()`).
+- **Kuota:** `QuotaTracker` (`quota.py`, in-memory, diisi dari `usage_logs`, ditambah oleh `Finalizer`). Dicek setelah RPM. Bila habis: 429 `insufficient_quota` (type sama, seperti OpenAI) dengan `Retry-After` sampai reset dan `x-should-retry: false`. Header `x-quota-tokens-{day,month}-{limit,remaining}`. Periode mengikuti waktu lokal mesin.
+- **Masa berlaku:** dicek di `require_api_key`. Bila lewat: 401 `api_key_expired`, tidak dihitung ke limiter gagal-auth per IP.
+- **Model per key:** `/v1/models` difilter, dan model lain dibalas 404 `model_not_found` dengan pesan yang sama seperti model tak dikenal.
+- **Antrean:** `GpuScheduler.enqueue(owner, priority)`. Dalam jalur, urutan: prioritas tertinggi → owner dengan request berjalan paling sedikit di jalur itu → paling lama. Serah terima giliran mendahulukan jalur dengan waiter prioritas. Prioritas tidak memotong giliran model yang sedang berjalan.
+- **Admin API/CLI/dashboard** mendapat field-field ini, pemakaian token per key, dan pesan untuk client (`CLIENT_GUIDE_URL` opsional).
+
+Reason:
+- **Kuota lunak di memori:** cukup untuk satu proses, tanpa query per request. Jumlah token baru diketahui di akhir request, jadi kuota keras akan butuh reservasi `max_tokens` yang terlalu pesimis.
+- **Waktu lokal (WIB):** lebih mudah dipahami pemilik dan client daripada UTC. Indonesia tanpa DST, dan tidak perlu paket `tzdata` di Windows.
+- **401/404 identik dengan perilaku OpenAI,** supaya SDK dan client tidak perlu kode khusus. `x-should-retry: false` mencegah SDK OpenAI mengulang 429 kuota.
+- **Fair share berdasarkan request berjalan:** sederhana (O(n), n ≤ `MAX_QUEUE`), dan bekerja walau semua key memakai batas default.
+
+Impact:
+- Key lama otomatis "tanpa batas / semua model / prioritas 0", jadi perilaku tidak berubah sampai kebijakan diisi.
+- Antrean tidak lagi murni FIFO dalam satu jalur, dan `position()` mengikuti urutan baru.
+- Request yang sedang berjalan boleh melewati sisa kuota.
+- Migrasi juga berjalan saat CLI membuka DB, jadi backup dulu sebelum deploy.
+- Setelah server restart, kuota diisi ulang dari DB; request yang masih di antrean `UsageWriter` saat itu bisa sedikit kurang terhitung.
+
+Alternative Considered:
+- Kuota keras dengan reservasi `max_tokens`: terlalu pesimis.
+- Query `SUM` di setiap request: beban DB tidak perlu.
+- Kuota dalam UTC: membingungkan.
+- 403 untuk model terlarang: membocorkan keberadaan model.
+- Round-robin murni per key: tidak menangani prioritas, dan tidak mempertimbangkan request yang sudah berjalan.
+- Prioritas yang memotong giliran model: memicu muat ulang model.
+- Halaman panduan publik di URL ngrok: menambah permukaan publik.
+
+---
+
+## 28. Jalur cepat key prioritas: slot cadangan dan gantian model seketika
+
+Date: 2026-10-18
+
+Context: Pemilik meminta key miliknya (`naufalnaufal`) tanpa batas dan "prioritas tanpa antrean". Batas key sudah dibuat maksimal (100.000/menit, 64 paralel, tanpa kuota, prioritas 9). Prioritas #27 hanya mengurutkan antrean, jadi key pemilik tetap menunggu bila semua slot dipakai client lain, atau bila model lain sedang memegang giliran. Benar-benar tanpa antre hanya mungkin dengan memutus request client lain. Pemilik memilih opsi "prioritas + slot cadangan".
+
+Decision: Untuk key dengan priority > 0:
+- `PRIORITY_RESERVED_SLOTS` (1) slot di setiap jalur dengan kapasitas lebih besar dari nilai itu (praktis: 1 dari 4 slot gemma) hanya untuk prioritas. Request biasa dijalankan selama `running < capacity - reserved`.
+- Tidak pernah ditolak karena antrean penuh (`MAX_QUEUE` hanya menghitung request biasa).
+- Batas tunggu `PRIORITY_QUEUE_TIMEOUT_S` (300 dtk), bukan 60.
+- Waiter prioritas di jalur lain membuat model aktif langsung berhenti menerima request baru (tanpa menunggu `MODEL_SWITCH_AFTER_S`). Request yang sedang berjalan tetap diselesaikan.
+
+Reason:
+- Slot cadangan membuat request gemma pemilik hampir selalu langsung jalan, tanpa merugikan client yang sedang berjalan.
+- Jalur 1 slot (qwen) tidak disisihkan, karena client biasa tidak akan pernah bisa memakainya.
+- Preemption ditolak, karena memutus request client lain.
+
+Impact:
+- **Client biasa** berbagi 3 slot gemma (throughput gabungan mereka sedikit turun saat ramai), dan bisa mengalami gantian model lebih sering bila pemilik memakai model yang berbeda.
+- **Key prioritas:**
+  - untuk qwen tetap menunggu satu request yang sedang berjalan;
+  - saat model lain aktif, tetap menunggu request yang berjalan selesai + muat model (~6 dtk dalam uji, vs 14,7 dtk untuk key biasa).
+- **Tanda prioritas di dashboard** berlaku untuk semua key yang dicentang. Jangan memberikannya ke client yang tidak dipercaya.
+- **Test** memakai `priority_reserved_slots=0` secara default.
+
+Alternative Considered:
+- Memutus request client lain (preemption): tanpa antre sama sekali, tetapi merugikan client.
+- Prioritas tanpa slot cadangan: pemilik bisa menunggu sampai ~30 dtk saat 4 slot penuh.
+- Slot cadangan juga untuk qwen: client biasa tidak bisa memakai qwen sama sekali.
+
+---
+
+## 29. Log prompt & jawaban untuk audit
+
+Date: 2026-11-03
+
+Context: Pemilik ingin tahu prompt apa yang masuk dan dari siapa, agar AI lokal tidak dipakai sembarang orang. Aturan sebelumnya melarang mencatat body sama sekali, dan `CLIENT.md` menjanjikan prompt tidak disimpan. Keputusan pemilik:
+- isi: prompt + jawaban;
+- retensi 30 hari;
+- dilihat lewat menu dashboard;
+- bisa diatur per key;
+- dashboard tidak boleh lag (dibatasi filter).
+
+Decision:
+- **Penyimpanan:** tabel `prompt_logs` di `data/gateway.db` (ACL terbatas), bukan file log teks. Kolom `api_keys.log_prompts` (default 1) lewat migrasi aditif.
+- **Penangkapan** (`gateway/promptlog.py`):
+  - setelah body terbaca, termasuk request yang kemudian ditolak. Penolakan sebelumnya (401, RPM, kuota) tidak punya body, jadi hanya ada di access log;
+  - teks per prompt dan per jawaban dipotong di `PROMPT_LOG_MAX_CHARS` (20.000);
+  - gambar diganti `[gambar ~N KB]`;
+  - `mask_secrets`.
+- **Jawaban:** dikumpulkan `ResponseCollector` dari JSON atau chunk SSE di `Finalizer`. Penulisan lewat `UsageWriter` (async, batch).
+- **Admin API:** `/admin/prompts` selalu dengan rentang waktu, `LIMIT` ≤ 100, kursor `ts|id`, dan cuplikan saja. `/admin/prompts/{id}` untuk detail.
+- **Menu dashboard *Prompt*:** filter, *Muat 50 lagi*, maksimal 500 baris, tanpa auto-refresh.
+- **Retensi:** `PROMPT_LOG_RETENTION_DAYS` (30). Kill switch `PROMPT_LOG_ENABLED`.
+- **Transparansi:** `CLIENT.md#privasi` memberi tahu client, dan menyarankan field `user` untuk identitas pengguna akhir.
+
+Reason:
+- **Audit:** API key mencegah akses tanpa izin, tetapi tidak menunjukkan *untuk apa* key dipakai. Log prompt menjawab "siapa memakai untuk apa", dan membantu memutuskan pencabutan key.
+- **Database, bukan file:** sudah ber-ACL, mudah difilter/dihalaman, dan dipangkas otomatis. File log teks lebih mudah terbaca akun lain.
+- **Dashboard tetap ringan** karena query selalu terbatas (index `ts`) dan isi lengkap diambil satu per satu.
+
+Impact:
+- **Aturan keamanan berubah** (`conventions.md` aturan 1, `memory.md` aturan 8): header/API key tetap tidak pernah dicatat, dan body tetap tidak boleh masuk file log; isi prompt hanya di `prompt_logs`.
+- **Data pribadi** client kini tersimpan 30 hari. Pemilik bertanggung jawab memberi tahu client (sudah di `CLIENT.md`) dan menjaga akses dashboard.
+- **Ukuran DB bertambah,** dibatasi oleh batas karakter dan retensi.
+- **Identitas pengguna akhir** hanya terlihat bila client mengirim field `user`. Gateway sendiri hanya tahu key dan IP.
+
+Alternative Considered:
+- File log harian JSON: tanpa filter dashboard, dan isinya bisa terbaca dari folder `logs/`.
+- Hanya cuplikan 1.000 karakter: kurang untuk audit.
+- Tanpa jawaban: tidak terlihat apa yang dihasilkan model.
+- Selalu mencatat tanpa pengecualian: pemilik ingin bisa mengecualikan key.
+
+QA (2026-11-03): review kode independen + uji performa 50 ribu baris + uji live + uji browser. Perbaikan yang dilakukan:
+- **Kunci varian huruf besar-kecil:** kunci varian di pesan/tools dibuang sebelum diteruskan, dan log menyimpan payload yang sudah dibersihkan.
+- **Kebijakan key baru yang tak sengaja kosong:** form kebijakan di dashboard tidak lagi ter-reset saat tab browser kembali aktif.
+- **Stream terputus:** token diestimasi dan masuk kuota.
+- **Pencarian yang menahan API:** koneksi read-only kedua untuk bacaan log prompt.
+- **Paging lambat:** kursor index-friendly.
+- **Perbaikan lain:**
+  - penjaga balapan di menu Prompt;
+  - dialog *Ubah* hanya mengirim field yang berubah;
+  - tanggal kedaluwarsa ekstrem → 400;
+  - giliran model baru mengisi slotnya sebelum gantian karena prioritas;
+  - validasi setting dan CLI;
+  - pencarian teks berkutip/baris baru;
+  - baris pengganti bila penangkapan gagal;
+  - pengumpul jawaban tidak pernah mematahkan respons.
