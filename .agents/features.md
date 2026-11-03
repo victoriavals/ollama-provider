@@ -15,6 +15,9 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Tools / function calling passthrough | Completed (kondisional, belum bisa diuji: gemma3 tanpa `tools`) |
 | API key auth | Completed (diuji live) |
 | Rate limit per key (RPM) | Completed (diuji live) |
+| Kebijakan per key: kuota token harian/bulanan, masa berlaku, model per key, prioritas | Completed (2026-10-18) |
+| Panduan client (`CLIENT.md`) + pesan siap kirim di dashboard | Completed (2026-10-18) |
+| Log prompt & jawaban (audit) + menu Prompt di dashboard | Completed (2026-11-03) |
 | Kontrol konkurensi (per key + antrean GPU sadar-model) | Completed (scheduler 2026-10-18, diuji live) |
 | Limit gagal-auth per IP | Completed |
 | Sanitasi request | Completed (diuji live) |
@@ -185,10 +188,94 @@ Notes:
 - Kapasitas: `qwen3.5:4b` 1, `gemma3:4b` 4.
 - Ping stream: `: ping queue=N` (posisi di jalur model). Ping dibuang oleh ngrok (komentar SSE), tetapi koneksi tetap aman.
 - Restart/shutdown: request yang antre mendapat 503 "the server is restarting" (`Retry-After: 15`).
-- Keadilan antar key hanya lewat `max_concurrent` per key; antrean FIFO.
+- Adil per key + prioritas (sejak 2026-10-18, [decisions.md #27](decisions.md#27-kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)): dalam satu jalur, prioritas → key dengan request berjalan paling sedikit → paling lama. Snapshot jalur menambah `priority_waiting` dan `reserved`.
+- Jalur cepat key prioritas ([decisions.md #28](decisions.md#28-jalur-cepat-key-prioritas-slot-cadangan-dan-gantian-model-seketika)):
+  - 1 slot gemma cadangan (`PRIORITY_RESERVED_SLOTS`);
+  - tidak ditolak karena antrean penuh, batas tunggu `PRIORITY_QUEUE_TIMEOUT_S` (300);
+  - model lain langsung gantian; tidak ada preemption.
 - Access log: `queue_ms`.
 - `/admin/status` → `gateway.concurrency`: `lanes`, `turn`, `stats` (granted/expired/rejected/switches). Field lama `global_limit`/`active`/`waiting`/`per_key_in_flight` tetap ada.
 - Batasan: request non-stream yang client-nya putus saat antre tetap dijalankan.
+
+## Kebijakan per Key (Kuota Token, Masa Berlaku, Model, Prioritas)
+
+Purpose: Membagikan API ke client lain dengan aman: membatasi total pemakaian, memberi akses sementara, membatasi model, dan mendahulukan key tertentu.
+
+Status: Completed (2026-10-18). Unit/integration test (`tests/test_key_policy.py`, `tests/test_scheduler.py`) + uji mutasi. Uji live: lihat [operations.md](operations.md#kebijakan-per-key-uji-live-2026-10-18).
+
+Location:
+- `gateway/db.py`: `KEY_MIGRATIONS`, `_migrate`, `token_usage_since`, `token_usage_by_key`
+- `gateway/quota.py`: `QuotaTracker`, `QuotaStatus`, `quota_exceeded`, `parse_expiry`, `local_periods`
+- `gateway/auth.py`: `ApiKey.from_row`, `is_expired`, `may_use`, cek `api_key_expired`
+- `gateway/apps/public.py`: kuota, model per key, filter `/v1/models`
+- `gateway/scheduler.py`: `owner`/`priority`, `_Lane.next_waiter`
+- `gateway/apps/admin.py`: `KeyPolicy`, `_policy`, `_token_usage`
+- `gateway/cli.py`: `create-key --daily-tokens --monthly-tokens --expires --models --priority`
+- dashboard: *API key*
+
+Important Files: `quota.py`, `db.py`, `auth.py`, `apps/public.py`, `scheduler.py`, `apps/admin.py`, `static/dashboard/app.js`
+
+Dependencies: tabel `usage_logs` (`total_tokens`, index `idx_usage_key_ts`), waktu lokal mesin (WIB), `USAGE_RETENTION_DAYS` ≥ 31 (kuota bulanan dihitung dari `usage_logs`)
+
+Notes:
+- **Kuota:**
+  - total token, lunak (request yang berjalan boleh melewati sisa);
+  - habis → 429 `insufficient_quota` + `Retry-After` sampai reset + `x-should-retry: false`;
+  - header `x-quota-tokens-{day,month}-{limit,remaining}` dihitung saat request mulai.
+- **Masa berlaku:**
+  - tanggal = hari terakhir berlaku; disimpan sebagai saat pertama tidak berlaku (UTC);
+  - lewat → 401 `api_key_expired`, tanpa strike gagal-auth.
+- **Model per key:** di luar daftar → 404 `model_not_found` dan tidak muncul di `/v1/models`. Daftar divalidasi terhadap tabel `models`, dan daftar kosong ditolak.
+- **Dashboard:**
+  - kolom *Kuota token* (bar hari/bulan), *Akses* (model, berlaku s.d., tag *Prioritas*);
+  - status *Kedaluwarsa* / *Kuota habis*;
+  - bagian *Batas lanjutan* di form; dialog *Ubah* memuat semua field;
+  - tombol *Pesan*.
+
+## Panduan Client
+
+Purpose: Memberi client semua yang perlu diketahui tanpa membuka README operator.
+
+Status: Completed (2026-10-18).
+
+Location:
+- `CLIENT.md`: akses, contoh curl/Python/JS, model, endpoint & field, batas & header, antrean, error, privasi; tanpa domain/rahasia.
+- Dashboard: setelah key dibuat, dialog menampilkan pesan siap kirim (URL, key, model, batas, kuota, masa berlaku, contoh Python, tautan `CLIENT_GUIDE_URL`). Tombol *Pesan* per key menyalin versi tanpa key.
+
+Important Files: `CLIENT.md`, `gateway/static/dashboard/app.js` (`clientMessage`), `gateway/config.py` (`client_guide_url`), `/admin/info`
+
+Dependencies: `PUBLIC_BASE_URL`, `CLIENT_GUIDE_URL` (opsional)
+
+Notes: Pesan berisi key; kirim lewat jalur pribadi.
+
+## Log Prompt & Jawaban (Audit)
+
+Purpose: Pemilik bisa melihat siapa (key, IP, field `user`) mengirim prompt apa dan apa jawabannya, untuk mendeteksi akses atau pemakaian yang tidak semestinya.
+
+Status: Completed (2026-11-03). `tests/test_prompt_log.py` (11 test) + uji mutasi 7/7 + uji UI dashboard (paging, filter, cari, XSS-safe).
+
+Location: `gateway/promptlog.py`, `gateway/db.py` (`prompt_logs`, `PromptRecord`, `insert_prompts`, `list_prompts`, `get_prompt`, `prune_prompts`), `gateway/apps/public.py` (penangkapan), `gateway/proxy.py` (`Finalizer` + `ResponseCollector`), `gateway/apps/admin.py` (`/admin/prompts`), menu *Prompt* dashboard, kolom `api_keys.log_prompts`
+
+Important Files: `promptlog.py`, `db.py`, `proxy.py`, `apps/admin.py`, `static/dashboard/app.js` (`loadPrompts`, `renderPrompts`, `showPrompt`)
+
+Dependencies: `PROMPT_LOG_ENABLED` (true), `PROMPT_LOG_RETENTION_DAYS` (30), `PROMPT_LOG_MAX_CHARS` (20000), `UsageWriter`
+
+Notes:
+- **Yang tercatat:** semua pesan (system/user/assistant/tool) dan nama tools; untuk completion/embedding, input-nya. Jawaban berisi teks + tool call (stream digabung dari chunk); embedding hanya `[N embedding]`.
+- **Request yang ditolak** setelah body terbaca (model tidak diizinkan, field salah, kuota per key setelah body…) tercatat dengan statusnya: model tidak diizinkan, field salah, batas paralel per key, antrean penuh, atau habis waktu. Penolakan sebelum body terbaca (401, RPM, kuota token) hanya ada di access log.
+- **Privasi:**
+  - gambar tidak disimpan;
+  - teks dipotong dengan catatan `… [dipotong N karakter]`;
+  - `sk-...` disamarkan;
+  - bisa dimatikan per key atau global;
+  - client diberi tahu di `CLIENT.md#privasi`.
+- **Dashboard ringan:**
+  - rentang waktu wajib (1 jam–30 hari, default 24 jam);
+  - 50 baris per halaman dengan tombol *Muat 50 lagi*, maksimal 500 di layar;
+  - cuplikan dibatasi 2 baris;
+  - isi lengkap baru diambil saat *Lihat* diklik;
+  - tanpa auto-refresh;
+  - semua teks lewat `textContent`.
 
 ## Limit Gagal-Auth per IP
 
@@ -300,7 +387,7 @@ Important Files: `apps/admin.py`, `db.py`
 
 Dependencies: `ADMIN_KEY`
 
-Notes: Plaintext key hanya dikembalikan saat dibuat. Semua aksi tercatat di audit log.
+Notes: Plaintext key hanya dikembalikan saat dibuat. Semua aksi tercatat di audit log (termasuk kebijakan per key). Sejak 2026-10-18 juga mengatur kuota token, masa berlaku, model per key, dan prioritas; daftar key menyertakan pemakaian token hari/bulan ini (lihat [Kebijakan per Key](#kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)).
 
 ## Admin: Laporan Usage
 
@@ -478,11 +565,9 @@ Belum ada kode. Sumber: sesi desain 2026-09-27 dan permintaan pemilik sesudahnya
 
 | Rencana | Catatan |
 |---|---|
-| Kuota token / billing per key | Baru ada RPM + konkurensi |
 | Admin jarak jauh tanpa SSH | Saat ini lewat SSH port forward. Alternatif: hostname terpisah + Cloudflare Access (jangan membuka port 8001 lewat ngrok) |
 | Model embedding | Kandidat `qwen3-embedding:0.6b` (0,64 GB, 100+ bahasa). Dengan `OLLAMA_MAX_LOADED_MODELS=1` setiap embedding mengusir model chat; evaluasi VRAM untuk `=2` |
 | Multi-node | Butuh state limit terpusat (tidak kompatibel dengan desain in-memory saat ini) |
 | Jadwal backup DB | `POST /admin/backup` sudah ada; pemilik menolak penjadwalan untuk saat ini |
 | Notifikasi Telegram | HealthMonitor → Telegram Bot API via `httpx` (tanpa dependency baru); token bot di `.env`. Menunggu keputusan pemilik |
 | Setting `PRIMARY_MODEL` | Diperlukan bila model utama bukan model aktif pertama secara alfabet (warm-up & contoh kode dashboard) |
-| Panduan client 1 halaman | Opsional |
