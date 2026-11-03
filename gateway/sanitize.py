@@ -108,6 +108,46 @@ def _common(body: dict[str, Any], allowed: set[str], settings: Settings) -> tupl
     return payload, include_usage
 
 
+MESSAGE_KEYS = ("role", "content", "name", "tool_calls", "tool_call_id")
+
+
+def _clean_part(part: dict[str, Any]) -> dict[str, Any]:
+    if part["type"] == "image_url":
+        image = part.get("image_url")
+        return {"type": "image_url", "image_url": {"url": image.get("url") if isinstance(image, dict) else image}}
+    return {"type": "text", "text": part.get("text")}
+
+
+def _clean_function(fn: Any, keys: tuple[str, ...], where: str) -> dict[str, Any]:
+    if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+        raise bad(f"{where}.function must be an object with a name.", param=where)
+    return {k: fn[k] for k in keys if k in fn}
+
+
+def _clean_message(msg: dict[str, Any], i: int) -> dict[str, Any]:
+    """Only exact OpenAI keys survive. Ollama (Go) matches JSON keys case-insensitively, so a stray
+    "Content" would reach the model while the checks above and the prompt log only see "content"."""
+    out = {k: msg[k] for k in MESSAGE_KEYS if k in msg}
+    if isinstance(out.get("content"), list):
+        out["content"] = [_clean_part(p) for p in out["content"]]
+    calls = out.get("tool_calls")
+    if calls is not None:
+        if not isinstance(calls, list) or not all(isinstance(c, dict) for c in calls):
+            raise bad(f"messages[{i}].tool_calls must be an array of objects.", param=f"messages[{i}].tool_calls")
+        out["tool_calls"] = [{**{k: c[k] for k in ("id", "type") if k in c},
+                              "function": _clean_function(c.get("function"), ("name", "arguments"),
+                                                          f"messages[{i}].tool_calls")} for c in calls]
+    return out
+
+
+def _clean_tools(tools: Any) -> list[dict[str, Any]]:
+    if not isinstance(tools, list) or not all(isinstance(t, dict) for t in tools):
+        raise bad("tools must be an array of objects.", param="tools")
+    return [{"type": t.get("type", "function"),
+             "function": _clean_function(t.get("function"), ("name", "description", "parameters", "strict"), "tools")}
+            for t in tools]
+
+
 def sanitize_chat(body: dict[str, Any], caps: Set[str], settings: Settings) -> tuple[dict[str, Any], bool]:
     if "completion" not in caps:
         raise bad(f"Model `{body['model']}` does not support chat completions.", param="model")
@@ -155,6 +195,9 @@ def sanitize_chat(body: dict[str, Any], caps: Set[str], settings: Settings) -> t
                   param="reasoning_effort")
 
     payload, include_usage = _common(body, CHAT_FIELDS, settings)
+    payload["messages"] = [_clean_message(m, i) for i, m in enumerate(messages)]
+    if payload.get("tools") is not None:
+        payload["tools"] = _clean_tools(payload["tools"])
     if "thinking" in caps:
         # Thinking models (e.g. qwen3.5) think by default and can spend the whole max_tokens
         # budget before answering: apply the server default unless the client chose.
