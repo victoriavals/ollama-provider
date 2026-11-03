@@ -6,9 +6,11 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import Request
 
+from .db import utcnow
 from .errors import APIError
 
 log = logging.getLogger("gateway.auth")
@@ -36,6 +38,26 @@ class ApiKey:
     prefix: str
     rpm_limit: int | None
     max_concurrent: int | None
+    daily_token_limit: int | None = None
+    monthly_token_limit: int | None = None
+    expires_at: str | None = None  # UTC ISO, same format as db.utcnow()
+    allowed_models: frozenset[str] | None = None  # None = every enabled model
+    priority: int = 0  # higher goes first in the GPU queue
+    log_prompts: bool = True  # False: this key's prompts and answers are not stored
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ApiKey":
+        models = row.get("allowed_models")
+        return cls(row["id"], row["name"], row["prefix"], row["rpm_limit"], row["max_concurrent"],
+                   row.get("daily_token_limit"), row.get("monthly_token_limit"), row.get("expires_at"),
+                   frozenset(models) if models is not None else None, row.get("priority") or 0,
+                   row.get("log_prompts", 1) != 0)
+
+    def is_expired(self, now_iso: str) -> bool:
+        return self.expires_at is not None and self.expires_at <= now_iso
+
+    def may_use(self, model: str) -> bool:
+        return self.allowed_models is None or model in self.allowed_models
 
 
 class KeyCache:
@@ -92,6 +114,10 @@ async def require_api_key(request: Request) -> ApiKey:
     access = getattr(request.state, "access", None)
     if access is not None:
         access.update(key_id=key.id, key=key.prefix, key_name=key.name)
+    if key.is_expired(utcnow()):
+        # A real key whose time is up: not a guessing attempt, so no failed-auth strike.
+        raise APIError(401, f"This API key expired at {key.expires_at}. Ask the provider for a new key.",
+                       code="api_key_expired")
     return key
 
 
