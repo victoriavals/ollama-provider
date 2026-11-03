@@ -46,10 +46,18 @@ Semua request generasi melewati antrean di gateway (`gateway/scheduler.py`), seh
 - **Batas.** Antre lebih dari 60 detik, atau datang saat 32 request sudah antre, dibalas `503 server_busy`.
 - **Client putus.** Client yang memutus stream saat antre langsung keluar dari antrean.
 - **Restart gateway.** Request yang sedang antre langsung dibalas `503 server_busy` ("the server is restarting", `Retry-After: 15`). Request yang sedang berjalan diberi waktu 10 detik untuk selesai.
-- **Keadilan antar key.** Antrean berurutan (FIFO). Satu-satunya pelindung adalah batas request bersamaan per key (default 2). Key dengan batas besar bisa membuat key lain menunggu di belakangnya, jadi jangan beri batas besar ke client yang tidak dipercaya.
+- **Adil antar key, dengan prioritas.** Saat slot kosong, key yang ditandai *prioritas* didahulukan. Setelah itu, key yang sedang paling sedikit menjalankan request di model tersebut, lalu yang paling lama menunggu. Client yang membanjiri request tidak bisa membuat client lain menunggu di belakang seluruh antreannya.
+- **Jalur cepat untuk key prioritas.** Key prioritas (mis. key milik pemilik) mendapat tiga keistimewaan:
+  - 1 slot gemma disisihkan khusus untuknya (`PRIORITY_RESERVED_SLOTS`), sehingga client lain berbagi 3 slot. qwen (1 slot) tidak disisihkan.
+  - Request-nya tidak pernah ditolak karena antrean penuh, dan batas tunggunya 300 detik (`PRIORITY_QUEUE_TIMEOUT_S`).
+  - Bila ia menunggu model lain, model yang sedang berjalan langsung gantian tanpa menunggu 10 detik.
+
+  Request client lain yang sedang berjalan tidak pernah diputus, jadi untuk qwen key prioritas tetap menunggu satu request yang sedang berjalan. Uji live: saat banjir request, request prioritas mulai dalam 0,1 detik; saat model lain aktif, tunggu turun dari 14,7 menjadi 5,8 detik.
 - **Memantau.** Antrean terlihat di dashboard (*Ringkasan → Antrean GPU per model*) dan di `scripts\status.ps1`.
 
 ## Untuk client: cara memakai API
+
+> Panduan khusus client (tanpa detail server) ada di **[CLIENT.md](CLIENT.md)**: akses, contoh kode, model, batas & kuota, antrean, dan arti error. Kirim tautannya bersama pesan yang dibuat dashboard saat membuat key.
 
 Client butuh dua hal:
 - **Base URL:** `https://<domain-ngrok>/v1`. Nilainya ada di `.env` (`PUBLIC_BASE_URL`) dan di dashboard (*Ringkasan → Cara akses*).
@@ -120,10 +128,12 @@ Field yang diteruskan ke Ollama hanya: `model, messages, prompt, input, stream, 
 |---|---|---|
 | 400 | `model_not_supported`, dll. | request tidak valid / fitur tidak didukung model |
 | 401 | `invalid_api_key` | key tidak ada / salah / dicabut |
+| 401 | `api_key_expired` | masa berlaku key habis (tidak dihitung sebagai percobaan auth gagal) |
 | 404 | `model_not_found` | model tidak di-enable |
 | 413 | `request_too_large` | body > `MAX_BODY_BYTES` (4 MB) |
 | 429 | `rate_limit_exceeded` | melewati batas request per menit key (`Retry-After`) |
 | 429 | `concurrency_limit_exceeded` | request paralel per key melewati batas |
+| 429 | `insufficient_quota` | kuota token harian/bulanan key habis (`Retry-After` = detik sampai reset, `x-should-retry: false`) |
 | 429 | `auth_rate_limited` | terlalu banyak auth gagal dari satu IP (diblokir 60 detik) |
 | 500 | `internal_error` | error tak terduga di gateway (detail hanya di log) |
 | 502 / 504 | `bad_gateway` / `upstream_timeout` | koneksi ke Ollama gagal / terlalu lama |
@@ -218,9 +228,10 @@ Select-String '^ADMIN_KEY=' D:\ML\ollama-provider\.env
 |---|---|
 | Bagian atas | Lampu status Ollama / GPU / Tunnel / Disk + meter slot GPU model yang sedang memegang GPU (dipakai/antre) |
 | Ringkasan | Request, gagal, dan token hari ini; **antrean GPU per model** (slot, antre, tunggu terlama, giliran); grafik request per jam (24 jam); **Cara akses** (URL publik + contoh kode, tombol salin); status semua dependency |
-| API key | Buat key (ditampilkan sekali), ubah batas per menit & request paralel, cabut |
+| API key | Buat key (ditampilkan sekali) beserta **pesan siap kirim untuk client**. Atur batas per menit, request paralel, kuota token harian/bulanan, masa berlaku, model yang boleh dipakai, dan prioritas antrean. Lihat pemakaian token hari/bulan ini per key, salin ulang pesan (tanpa key), cabut |
 | Pemakaian | Per key / model / hari, rentang 24 jam / 7 hari / 30 hari |
 | Request | 100 request terakhir (waktu, key, model, status, token, latensi, IP), diperbarui otomatis, filter "hanya yang gagal" |
+| Prompt | **Log prompt & jawaban**: siapa (key, IP, field `user`), kapan, model, status, cuplikan prompt/jawaban. Filter rentang waktu (1 jam–30 hari), key, model, status, dan cari teks. Isi lengkap dibuka per baris. Supaya tetap ringan: 50 baris per halaman (maks. 500 di layar), tanpa refresh otomatis |
 | Model | Unduh model (dengan progres), aktifkan/nonaktifkan, hapus |
 
 Dashboard tidak memuat script dari luar, memakai CSP ketat, menolak Host header asing (anti DNS rebinding), dan menyimpan admin key hanya selama tab terbuka. Tombol start/stop service sengaja tidak ada (gateway berjalan dengan hak rendah); gunakan PowerShell.
@@ -229,10 +240,21 @@ Dashboard tidak memuat script dari luar, memakai CSP ketat, menolak Host header 
 
 ```powershell
 .venv\Scripts\python.exe -m gateway.cli create-key --name client-a --rpm 60 --max-concurrent 2
+.venv\Scripts\python.exe -m gateway.cli create-key --name teman-a --daily-tokens 100000 --monthly-tokens 2000000 --expires 2026-12-31 --models gemma3:4b --priority 0
 .venv\Scripts\python.exe -m gateway.cli list-keys
 .venv\Scripts\python.exe -m gateway.cli revoke-key 3
 .venv\Scripts\python.exe -m gateway.cli usage --days 30 --group-by key
 ```
+
+Kebijakan per key (semua opsional; kosong = tanpa batas / semua model / tidak kedaluwarsa):
+
+| Kebijakan | Perilaku |
+|---|---|
+| Kuota token harian / bulanan | Total token (input + output), reset 00:00 / tanggal 1 waktu server (WIB). Habis → `429 insufficient_quota`. Kuota lunak: request yang sedang berjalan boleh melewati sisa kuota. Client melihat sisanya di header `x-quota-tokens-{day,month}-remaining` |
+| Masa berlaku | Tanggal = hari terakhir key berlaku (sampai 23:59 WIB). Setelahnya `401 api_key_expired` |
+| Model yang boleh dipakai | Model lain tidak muncul di `/v1/models` dan dibalas `404 model_not_found` |
+| Prioritas | Didahulukan di antrean, memakai slot cadangan, tidak ditolak karena antrean penuh, dan membuat model lain langsung gantian (lihat [Antrean GPU](#antrean-gpu)) |
+| Catat prompt & jawaban | Default aktif: isi prompt dan jawaban key ini masuk menu *Prompt*. Matikan untuk key yang tidak perlu diaudit (CLI: `--no-prompt-log`) |
 
 Key hanya ditampilkan sekali; database hanya menyimpan hash SHA-256 dan prefix-nya. Perubahan lewat CLI berlaku paling lambat 30 detik (cache auth), sedangkan lewat dashboard atau admin API berlaku langsung.
 
@@ -252,10 +274,12 @@ Header: `Authorization: Bearer <ADMIN_KEY>`. Dokumentasi interaktif: `http://127
 
 | Endpoint | |
 |---|---|
-| `POST /admin/keys` `{name, rpm_limit?, max_concurrent?}` | buat key |
-| `GET /admin/keys` · `PATCH /admin/keys/{id}` · `DELETE /admin/keys/{id}` | list / ubah / cabut |
+| `POST /admin/keys` `{name, rpm_limit?, max_concurrent?, daily_token_limit?, monthly_token_limit?, expires_at?, allowed_models?, priority?}` | buat key (`expires_at`: tanggal ISO = hari terakhir, atau datetime ISO) |
+| `GET /admin/keys` · `PATCH /admin/keys/{id}` · `DELETE /admin/keys/{id}` | list (dengan `usage` token hari/bulan ini, `expired`, `quota_resets`) / ubah (`null` = kembali ke default) / cabut |
 | `GET /admin/usage?since=&until=&key_id=&group_by=hour\|day\|key\|model` | ringkasan pemakaian |
 | `GET /admin/usage/recent?limit=50` | log request terbaru |
+| `GET /admin/prompts?since=&until=&key_id=&model=&status=all\|ok\|error&q=&limit=50&before=` | log prompt (cuplikan; default 24 jam terakhir; `next` = kursor halaman berikutnya) |
+| `GET /admin/prompts/{id}` | isi lengkap satu prompt + jawaban |
 | `GET /admin/models` · `PATCH /admin/models/{name}` `{enabled}` | allowlist model |
 | `POST /admin/models/pull` `{model, enable}` → `GET /admin/models/pull/{job}` | unduh model di background |
 | `DELETE /admin/models/{name}` | hapus model |
@@ -336,7 +360,15 @@ Pemilik masuk lewat **SSH di atas Tailscale**. Profil Tailscale di PC ini terika
   - Gateway berjalan sebagai **LocalService** (bukan SYSTEM), karena folder project bisa diedit akun lain.
   - `D:\ollama` (dijalankan sebagai SYSTEM) hanya bisa diubah Administrator.
   - `.env`, `data\`, dan `ngrok.yml` hanya bisa dibaca SYSTEM, Administrators, dan akun installer.
-- **Log tidak pernah memuat** header Authorization, isi request/prompt, maupun API key.
+- **Log teks tidak pernah memuat** header Authorization, isi request/prompt, maupun API key.
+- **Log prompt (audit):**
+  - Isi prompt & jawaban dicatat di tabel `prompt_logs` dalam `data\gateway.db`, yang aksesnya dibatasi seperti `.env`.
+  - Hanya bisa dilihat lewat admin API/dashboard.
+  - Disimpan 30 hari (`PROMPT_LOG_RETENTION_DAYS`).
+  - Gambar tidak disimpan (hanya ukurannya), teks dipotong di `PROMPT_LOG_MAX_CHARS`, dan teks mirip `sk-...` disamarkan.
+  - Bisa dimatikan per key (*Catat prompt & jawaban*) atau seluruhnya (`PROMPT_LOG_ENABLED=false`).
+  - **File backup** (`data\backups\`, dari *Backup DB*) ikut berisi log prompt dan tidak dihapus otomatis. Hapus backup lama supaya janji 30 hari ke client tetap benar.
+  - Client diberi tahu lewat [CLIENT.md](CLIENT.md#privasi).
 - **Repo ini publik:** `.env`, `data\`, dan `logs\` ada di `.gitignore`. Jangan menulis domain ngrok, token, atau key di file yang di-commit.
 - **Diketahui dan diterima:**
   - ngrok (seperti semua layanan tunnel) membuka HTTPS di servernya, jadi dapat melihat lalu lintas.
@@ -351,18 +383,21 @@ Daftar lengkap ada di `.env.example`. Yang paling sering disentuh:
 |---|---|---|
 | `ADMIN_KEY` | (dibuat installer) | Kunci admin API & dashboard |
 | `PUBLIC_BASE_URL` | (diisi `install-ngrok.ps1`) | URL publik yang ditampilkan di dashboard |
+| `CLIENT_GUIDE_URL` | kosong | Tautan panduan client (mis. `CLIENT.md` di GitHub) yang dimasukkan ke pesan untuk client |
 | `DEFAULT_RPM` / `DEFAULT_MAX_CONCURRENT` | 60 / 2 | Batas default per key (bisa diubah per key) |
 | `GLOBAL_CONCURRENCY` | 4 | Slot GPU; samakan dengan `OLLAMA_NUM_PARALLEL` |
 | `QUEUE_TIMEOUT_S` | 60 | Lama antre maksimal sebelum `503 server_busy` |
 | `MAX_QUEUE` | 32 | Jumlah request antre (semua model); lebih dari itu langsung `503` |
 | `MODEL_SWITCH_AFTER_S` | 10 | Lama minimal satu model memegang GPU sebelum gantian ke model lain yang menunggu |
 | `MODEL_PARALLEL` / `SERIAL_ARCHITECTURES` | kosong / `qwen35` | Slot paralel per model (`nama=N`) / arsitektur yang hanya 1 request sekaligus di Ollama |
+| `PRIORITY_RESERVED_SLOTS` / `PRIORITY_QUEUE_TIMEOUT_S` | 1 / 300 | Slot per model yang disisihkan untuk key prioritas (hanya model dengan slot lebih banyak dari ini) / batas tunggu key prioritas |
 | `MAX_TOKENS_CAP` | 2048 | Batas maksimal `max_tokens` |
 | `DEFAULT_REASONING_EFFORT` | `none` | Mode berpikir default untuk model "thinking" (`none`/`medium`/`high`/kosong) |
 | `SEED_MODELS` | `gemma3:4b` | Model yang otomatis masuk allowlist saat start pertama |
 | `CLIENT_IP_HEADERS` | `cf-connecting-ip,x-forwarded-for` | Header IP asli client dari tunnel |
 | `WATCH_SERVICES` | `OllamaServe,Cloudflared` (diganti `OllamaServe,NgrokTunnel` oleh `install-ngrok.ps1`) | Service yang dipantau health monitor |
 | `LOG_RETENTION_DAYS` / `USAGE_RETENTION_DAYS` | 30 / 90 | Lama penyimpanan log / usage |
+| `PROMPT_LOG_ENABLED` / `PROMPT_LOG_RETENTION_DAYS` / `PROMPT_LOG_MAX_CHARS` | true / 30 / 20000 | Log prompt & jawaban: aktif, lama simpan, batas karakter per prompt dan per jawaban |
 
 Setelah mengubah `.env`, jalankan `Restart-Service OllamaGateway`. Env var milik service (mis. `LOG_CONSOLE=false`) menang atas `.env`.
 
