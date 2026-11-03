@@ -14,6 +14,7 @@ from .db import Database, UsageWriter, utcnow
 from .health import HealthMonitor
 from .limits import ConcurrencyGate, FailedAuthLimiter, SlidingWindow
 from .ollama import OllamaClient
+from .quota import QuotaTracker
 from .scheduler import GpuScheduler
 
 log = logging.getLogger("gateway")
@@ -31,8 +32,9 @@ class Gateway:
         self.rpm = SlidingWindow(60.0)
         self.failed_auth = FailedAuthLimiter(settings.failed_auth_per_ip_per_min)
         self.gate = ConcurrencyGate()
+        self.quota = QuotaTracker(self.db)
         self.scheduler = GpuScheduler(settings.global_concurrency, settings.max_queue,
-                                      settings.model_switch_after_s)
+                                      settings.model_switch_after_s, reserved_slots=settings.priority_reserved_slots)
         self.keys = KeyCache()
         self.pulls = PullManager(self)
         self.health = HealthMonitor(self)
@@ -71,7 +73,7 @@ class Gateway:
         if found:
             return key
         row = await self.db.get_active_key_by_hash(key_hash)
-        key = ApiKey(row["id"], row["name"], row["prefix"], row["rpm_limit"], row["max_concurrent"]) if row else None
+        key = ApiKey.from_row(row) if row else None
         self.keys.put(key_hash, key)
         return key
 
@@ -81,6 +83,10 @@ class Gateway:
                 removed = await self.db.prune_usage(self.settings.usage_retention_days)
                 if removed:
                     log.info("pruned %d usage rows older than %d days", removed, self.settings.usage_retention_days)
+                removed = await self.db.prune_prompts(self.settings.prompt_log_retention_days)
+                if removed:
+                    log.info("pruned %d prompt-log rows older than %d days", removed,
+                             self.settings.prompt_log_retention_days)
             except Exception:
                 log.exception("usage prune failed")
             await asyncio.sleep(PRUNE_INTERVAL_S)
