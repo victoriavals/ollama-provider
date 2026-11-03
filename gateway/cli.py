@@ -1,6 +1,8 @@
 """Local management CLI (works directly on the SQLite DB, no admin key needed).
 
     python -m gateway.cli create-key --name client-a [--rpm 60] [--max-concurrent 2]
+        [--daily-tokens 100000] [--monthly-tokens 2000000] [--expires 2026-12-31]
+        [--models gemma3:4b,qwen3.5:4b] [--priority 1]
     python -m gateway.cli list-keys
     python -m gateway.cli revoke-key 3
     python -m gateway.cli list-models | enable-model NAME | disable-model NAME
@@ -20,6 +22,7 @@ from .auth import display_prefix, generate_key, hash_key
 from .config import get_settings
 from .db import Database, days_ago
 from .logs import TEXT_FORMAT, DailyFileHandler
+from .quota import parse_expiry
 
 audit = logging.getLogger("gateway.cli")
 
@@ -54,15 +57,28 @@ async def run(args: argparse.Namespace) -> None:
     try:
         await db.seed_models(settings.seed_model_list)
         if args.cmd == "create-key":
+            policy = {"daily_token_limit": args.daily_tokens, "monthly_token_limit": args.monthly_tokens,
+                      "priority": args.priority, "log_prompts": False if args.no_prompt_log else None,
+                      "expires_at": parse_expiry(args.expires) if args.expires else None,
+                      "allowed_models": [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None}
+            if policy["allowed_models"] is not None:
+                unknown = set(policy["allowed_models"]) - {m["name"] for m in await db.list_models()}
+                if unknown or not policy["allowed_models"]:
+                    raise SystemExit(f"unknown or empty --models: {', '.join(sorted(unknown)) or '(empty)'}")
             key = generate_key()
-            row = await db.create_key(args.name, hash_key(key), display_prefix(key), args.rpm, args.max_concurrent)
-            audit.info("key created via CLI id=%s name=%r prefix=%s rpm=%s max_concurrent=%s",
-                       row["id"], row["name"], row["prefix"], row["rpm_limit"], row["max_concurrent"])
+            row = await db.create_key(args.name, hash_key(key), display_prefix(key), args.rpm, args.max_concurrent,
+                                      **policy)
+            audit.info("key created via CLI id=%s name=%r prefix=%s rpm=%s max_concurrent=%s policy=%s",
+                       row["id"], row["name"], row["prefix"], row["rpm_limit"], row["max_concurrent"],
+                       {k: v for k, v in policy.items() if v})
             print(f"Created key id={row['id']} name={row['name']}")
             print(f"API key (shown once, store it now): {key}")
         elif args.cmd == "list-keys":
-            _table(await db.list_keys(), ["id", "name", "prefix", "rpm_limit", "max_concurrent",
-                                          "created_at", "last_used_at", "revoked_at"])
+            rows = [{**r, "allowed_models": ",".join(r["allowed_models"]) if r["allowed_models"] else None}
+                    for r in await db.list_keys()]
+            _table(rows, ["id", "name", "prefix", "rpm_limit", "max_concurrent", "daily_token_limit",
+                          "monthly_token_limit", "expires_at", "allowed_models", "priority", "log_prompts",
+                          "last_used_at", "revoked_at"])
         elif args.cmd == "revoke-key":
             revoked = await db.revoke_key(args.id)
             if revoked:
@@ -95,6 +111,12 @@ def main() -> None:
     p.add_argument("--name", required=True)
     p.add_argument("--rpm", type=int, default=None, help="requests per minute (default from .env)")
     p.add_argument("--max-concurrent", type=int, default=None, help="in-flight requests (default from .env)")
+    p.add_argument("--daily-tokens", type=int, default=None, help="token quota per local day (default: none)")
+    p.add_argument("--monthly-tokens", type=int, default=None, help="token quota per local month (default: none)")
+    p.add_argument("--expires", default=None, help="last valid local day YYYY-MM-DD, or an ISO datetime")
+    p.add_argument("--models", default=None, help="comma-separated models this key may use (default: all)")
+    p.add_argument("--priority", type=int, default=0, help="queue priority 0-9 (default 0)")
+    p.add_argument("--no-prompt-log", action="store_true", help="do not store this key's prompts and answers")
 
     sub.add_parser("list-keys", help="list API keys")
     p = sub.add_parser("revoke-key", help="revoke an API key")
@@ -113,6 +135,17 @@ def main() -> None:
     sub.add_parser("gen-admin-key", help="print a random value for ADMIN_KEY")
 
     args = parser.parse_args()
+    if args.cmd == "create-key":
+        if args.expires:
+            try:
+                parse_expiry(args.expires)
+            except ValueError:
+                parser.error("--expires must be a date YYYY-MM-DD (or ISO datetime) between 2000 and 2100")
+        if not 0 <= args.priority <= 9:
+            parser.error("--priority must be between 0 and 9")
+        for flag in ("rpm", "max_concurrent", "daily_tokens", "monthly_tokens"):
+            if getattr(args, flag) is not None and getattr(args, flag) < 1:
+                parser.error(f"--{flag.replace('_', '-')} must be at least 1")
     if args.cmd == "gen-admin-key":
         print("adm-" + secrets.token_urlsafe(32))
         return
