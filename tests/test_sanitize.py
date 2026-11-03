@@ -137,3 +137,34 @@ def test_completions_rejected_for_thinking_models():
 def test_invalid_default_reasoning_effort_setting():
     with pytest.raises(ValueError):
         Settings(_env_file=None, default_reasoning_effort="max")
+
+
+def test_messages_keep_only_exact_openai_keys():
+    # Ollama (Go) reads JSON keys case-insensitively: "Content" must not slip past the checks and the log.
+    msgs = [{"role": "user", "content": "innocent", "Content": "hidden", "images": ["x"], "name": "budi"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "Function": {"name": "evil"},
+                 "function": {"name": "cek", "arguments": "{}", "Name": "evil"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "cerah"}]
+    payload, _ = sanitize_chat(chat(messages=msgs), {"completion", "tools"}, S)
+    assert payload["messages"] == [
+        {"role": "user", "content": "innocent", "name": "budi"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "cek", "arguments": "{}"}}]},
+        {"role": "tool", "content": "cerah", "tool_call_id": "c1"}]
+    parts = [{"type": "text", "text": "hi", "Text": "x"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}, "URL": "x"}]
+    payload, _ = sanitize_chat(chat(messages=[{"role": "user", "content": parts}]), CHAT_CAPS, S)
+    assert payload["messages"][0]["content"] == [{"type": "text", "text": "hi"},
+                                                  {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+
+
+def test_tools_and_tool_calls_are_validated_and_cleaned():
+    tools = [{"type": "function", "function": {"name": "cek", "description": "d", "parameters": {}, "Description": "x"}}]
+    payload, _ = sanitize_chat(chat(tools=tools), {"completion", "tools"}, S)
+    assert payload["tools"] == [{"type": "function", "function": {"name": "cek", "description": "d", "parameters": {}}}]
+    for bad_body in (chat(tools=[{"function": "x"}]), chat(tools=5),
+                     chat(messages=[{"role": "assistant", "tool_calls": 5}]),
+                     chat(messages=[{"role": "assistant", "tool_calls": [{"function": "x"}]}])):
+        with pytest.raises(APIError) as e:
+            sanitize_chat(bad_body, {"completion", "tools"}, S)
+        assert e.value.status_code == 400
