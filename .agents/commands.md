@@ -84,6 +84,9 @@ CLI (langsung ke `data/gateway.db`, tanpa admin key; perubahan key berlaku di se
 
 ```powershell
 .venv\Scripts\python.exe -m gateway.cli create-key --name client-a [--rpm 60] [--max-concurrent 2]
+.venv\Scripts\python.exe -m gateway.cli create-key --name teman-a --daily-tokens 100000 --monthly-tokens 2000000 --expires 2026-12-31 --models gemma3:4b --priority 0
+.venv\Scripts\python.exe -m gateway.cli create-key --name pribadi --no-prompt-log   # prompt key ini tidak dicatat
+# CLI membuka DB langsung dan ikut menjalankan migrasi kolom baru: backup dulu setelah upgrade kode
 .venv\Scripts\python.exe -m gateway.cli list-keys
 .venv\Scripts\python.exe -m gateway.cli revoke-key <id>
 .venv\Scripts\python.exe -m gateway.cli list-models
