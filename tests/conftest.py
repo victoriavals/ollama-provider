@@ -58,6 +58,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
     values = dict(
         _env_file=None, db_path=tmp_path / "test.db", admin_key=ADMIN_KEY, ollama_base_url=OLLAMA,
         warmup=False, global_concurrency=2, queue_timeout_s=0.3, stream_ping_interval_s=0.05,
+        priority_reserved_slots=0,  # tests that need the reservation set it explicitly
         default_rpm=100, default_max_concurrent=2, failed_auth_per_ip_per_min=5, max_body_bytes=10_000,
         seed_models="gemma3:4b,nomic-embed-text", log_dir=tmp_path / "logs", health_interval_s=0,
         watch_services="",
@@ -94,10 +95,12 @@ async def admin(gw):
         yield client
 
 
-async def new_key(gw: Gateway, **limits) -> tuple[int, str]:
+async def new_key(gw: Gateway, name: str = "test", **limits) -> tuple[int, str]:
+    """limits: rpm_limit, max_concurrent and any key policy column (daily_token_limit, expires_at, ...)."""
     key = generate_key()
-    row = await gw.db.create_key("test", hash_key(key), display_prefix(key),
-                                 limits.get("rpm_limit"), limits.get("max_concurrent"))
+    policy = {k: v for k, v in limits.items() if k not in ("rpm_limit", "max_concurrent")}
+    row = await gw.db.create_key(name, hash_key(key), display_prefix(key),
+                                 limits.get("rpm_limit"), limits.get("max_concurrent"), **policy)
     return row["id"], key
 
 
