@@ -73,7 +73,9 @@ Konfigurasi uvicorn: `lifespan="off"`, `access_log=False`, `log_config=None`, `s
 | `Database`, `UsageRecord`, `UsageWriter` | `db.py` | Schema, query, penulisan usage secara batch | `Gateway`, CLI |
 | `OllamaClient`, `ModelInfo` | `ollama.py` | `httpx.AsyncClient` ke Ollama, cache capability + arsitektur (`/api/show`), pull/delete/warm-up | proxy, admin, health |
 | `SlidingWindow`, `FailedAuthLimiter`, `ConcurrencyGate`, `RateResult` | `limits.py` | RPM per key, gagal-auth per IP, slot per key (fail fast) | public app, proxy |
-| `GpuScheduler`, `Ticket`, `resolve_capacity` | `scheduler.py` | Antrean GPU sadar-model: jalur FIFO per model, kapasitas per model, giliran satu model, batas antrean & waktu tunggu | proxy, warm-up, `/admin/status` |
+| `GpuScheduler`, `Ticket`, `resolve_capacity` | `scheduler.py` | Antrean GPU sadar-model: jalur per model (urutan: prioritas → key dengan request berjalan paling sedikit → paling lama), kapasitas per model, giliran satu model, batas antrean & waktu tunggu | proxy, warm-up, `/admin/status` |
+| `QuotaTracker`, `QuotaStatus`, `parse_expiry` | `quota.py` | Kuota token harian/bulanan per key (waktu lokal), header `x-quota-*`, 429 `insufficient_quota`; parsing masa berlaku | public app, proxy (`Finalizer`), admin, CLI |
+| `capture_prompt`, `new_record`, `ResponseCollector` | `promptlog.py` | Log prompt & jawaban: isi dipotong, gambar diganti ukuran, `sk-...` disamarkan; jawaban dikumpulkan dari JSON/chunk SSE | public app, proxy (`Finalizer`) |
 | `KeyCache`, `require_api_key`, `require_admin` | `auth.py` | Lookup key (hash SHA-256), dependency FastAPI | public/admin app |
 | `sanitize_*`, `read_json_body` | `sanitize.py` | Allowlist field, validasi, cap `max_tokens`, batas body | public app |
 | `forward_json`, `stream_sse`, `Finalizer`, `ClosingStreamingResponse` | `proxy.py` | Meneruskan request ke Ollama `/v1/*` | public app |
@@ -88,18 +90,23 @@ Konfigurasi uvicorn: `lifespan="off"`, `access_log=False`, `log_config=None`, `s
 
 ```
 RequestContextMiddleware  (buat request_id, state.access = {})
-  -> require_api_key       (blokir IP dengan >= 20 gagal/menit -> 429; lookup hash via KeyCache/DB -> 401)
+  -> require_api_key       (blokir IP dengan >= 20 gagal/menit -> 429; lookup hash via KeyCache/DB -> 401;
+                            key kedaluwarsa -> 401 api_key_expired, tanpa strike gagal-auth)
   -> _generate()  [apps/public.py]
        1. gw.rpm.hit(key)                  -> 429 rate_limit_exceeded (+ Retry-After)
+          quota.status(key) (bila key punya kuota) -> 429 insufficient_quota (+ Retry-After, x-should-retry: false);
+          header x-quota-tokens-{day,month}-{limit,remaining} ikut ke semua response
        2. read_json_body (hitung byte)     -> 413 / 400
-       3. require_model + is_model_enabled -> 404 model_not_found
+       3. require_model; bila PROMPT_LOG_ENABLED dan key.log_prompts: promptlog.new_record(body) -> ctx.prompt
+          key.may_use + is_model_enabled -> 404 model_not_found
+          (APIError setelah titik ini: PromptRecord ikut disubmit dengan status error)
        4. ollama.model_info(model)         -> /api/show (cache 10 menit): capabilities + arsitektur
        5. sanitize_chat/completion/embeddings -> 400 (payload hanya berisi field allowlist;
           model `thinking` diberi reasoning_effort default, /v1/completions ditolak untuknya)
        6. gate.try_acquire_key             -> 429 concurrency_limit_exceeded
           (setiap APIError di langkah 1-6 -> UsageRecord dengan status error)
           ctx.gpu_capacity = resolve_capacity(model, arsitektur)  (qwen35 -> 1, lainnya 4)
-       7. scheduler.enqueue(model, kapasitas, QUEUE_TIMEOUT_S) -> Ticket (dipegang Finalizer)
+       7. scheduler.enqueue(model, kapasitas, QUEUE_TIMEOUT_S, owner=key.id, priority=key.priority) -> Ticket (dipegang Finalizer)
           antrean penuh (MAX_QUEUE) -> 503 server_busy langsung (juga untuk stream: HTTP 503 asli)
        7a. stream=false -> forward_json():
              ticket.wait() -> False (habis waktu) -> 503 server_busy
@@ -111,7 +118,8 @@ RequestContextMiddleware  (buat request_id, state.access = {})
              buang chunk usage jika client tidak minta include_usage
              error setelah header -> data: {"error": ...}
        Finalizer() (tepat sekali): ticket.close() (keluar antrean / lepas slot GPU), lepas slot key,
-                                    submit UsageRecord, tulis status/token/queue_ms ke state.access
+                                    submit UsageRecord, tulis status/token/queue_ms ke state.access,
+                                    lengkapi + submit PromptRecord (status, token, jawaban dari ResponseCollector)
   <- middleware menulis baris JSON ke access-YYYY-MM-DD.log setelah response selesai
 ```
 
@@ -136,7 +144,7 @@ Pemetaan error transport (`proxy.map_transport_error`): ConnectError/ConnectTime
 |---|---|---|---|
 | GET | `/health` | tidak | `health()` → `{"status":"ok"}` |
 | GET | `/health/ready` | tidak | `ready()` → 200 `ready` / 503 `unavailable` (cek `/api/version`) |
-| GET | `/v1/models` | Bearer API key | model `enabled=1` dari DB (tidak dihitung ke RPM) |
+| GET | `/v1/models` | Bearer API key | model `enabled=1` dari DB, difilter `allowed_models` key (tidak dihitung ke RPM) |
 | POST | `/v1/chat/completions` | Bearer API key | `_generate(..., "chat")` |
 | POST | `/v1/completions` | Bearer API key | `_generate(..., "completions")` |
 | POST | `/v1/embeddings` | Bearer API key | `_generate(..., "embeddings")`, hanya untuk model dengan capability `embedding` |
@@ -147,12 +155,14 @@ Pemetaan error transport (`proxy.map_transport_error`): ConnectError/ConnectTime
 
 | Method | Path | Fungsi |
 |---|---|---|
-| POST | `/admin/keys` | Buat key (`name`, `rpm_limit?`, `max_concurrent?`). Plaintext dikembalikan sekali |
-| GET | `/admin/keys?include_revoked=` | Daftar key (tanpa hash) + `*_effective` |
-| PATCH | `/admin/keys/{id}` | Ubah `name`/`rpm_limit`/`max_concurrent` (`null` = kembali ke default) |
+| POST | `/admin/keys` | Buat key (`name`, `rpm_limit?`, `max_concurrent?`, `daily_token_limit?`, `monthly_token_limit?`, `expires_at?`, `allowed_models?`, `priority?`). Plaintext dikembalikan sekali. `allowed_models` divalidasi terhadap tabel `models`; `expires_at` tanggal = hari terakhir berlaku (lokal) |
+| GET | `/admin/keys?include_revoked=` | Daftar key (tanpa hash) + `*_effective`, `expired`, `usage` (token hari/bulan ini) + `quota_resets` |
+| PATCH | `/admin/keys/{id}` | Ubah field mana pun di atas (`null` = kembali ke default / tanpa batas / semua model / prioritas 0) |
 | DELETE | `/admin/keys/{id}` | Revoke (soft delete) dan kosongkan `KeyCache` |
 | GET | `/admin/usage?since&until&key_id&group_by=hour\|day\|key\|model` | Ringkasan (default 7 hari) |
 | GET | `/admin/usage/recent?limit&key_id` | Baris `usage_logs` terbaru |
+| GET | `/admin/prompts?since&until&key_id&model&status&q&before&limit` | Log prompt, terbaru dulu, **cuplikan saja**. Default 24 jam terakhir, `limit` ≤ 100, `q` ≥ 3 huruf (LIKE dengan escape), `next` = kursor `ts|id` |
+| GET | `/admin/prompts/{id}` | Isi lengkap satu baris log prompt (`prompt` sebagai list pesan + `response`) |
 | GET | `/admin/models` | Gabungan `/api/tags` dan allowlist DB |
 | PATCH | `/admin/models/{name:path}` | `{"enabled": bool}`. Enable hanya untuk model yang terinstal |
 | POST | `/admin/models/pull` | `{"model", "enable"}` → job 202 (background) |
@@ -206,7 +216,14 @@ Timeout `httpx`: connect 5 dtk, read 300 dtk, write 30 dtk, pool 30 dtk. Limit k
 - **Ticket antrean tanpa race**: `GpuScheduler` hanya mengubah state di method sinkron (enqueue, `Ticket.close`, callback expire), dan setiap perubahan memanggil `_dispatch()`. Future ticket hanya diselesaikan scheduler; pemanggil menunggu dengan `asyncio.wait` tanpa membatalkannya, lalu `Finalizer` menutup ticket tepat sekali.
 - **Shutdown**: handler sinyal menjadwalkan `scheduler.close()` lewat `loop.call_soon_threadsafe` (bukan langsung, karena sinyal bisa memotong perubahan state). Semua waiter langsung dilepas dengan 503 `server_busy` "the server is restarting" (`Retry-After: 15`), dan request baru ditolak. Request yang berjalan diberi `timeout_graceful_shutdown` 10 dtk.
 - **Warm-up oportunistik**: warm-up hanya berjalan bila slot langsung tersedia (`enqueue(..., timeout=0)` lalu cek `ticket.granted`). Warm-up tidak pernah antre, sehingga tidak memaksa model yang sedang berjalan untuk gantian.
-- **Giliran model**: satu model memegang GPU; giliran pindah bila model lain menunggu dan giliran sudah ≥ `MODEL_SWITCH_AFTER_S` (umur giliran dihitung ulang saat model itu mulai lagi dari GPU senggang). Request yang berjalan diselesaikan dulu, sehingga request dikelompokkan per model (detail: [decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)).
+- **Giliran model**: satu model memegang GPU; giliran pindah bila model lain menunggu dan giliran sudah ≥ `MODEL_SWITCH_AFTER_S` (umur giliran dihitung ulang saat model itu mulai lagi dari GPU senggang). Request yang berjalan diselesaikan dulu, sehingga request dikelompokkan per model (detail: [decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)). Serah terima giliran mendahulukan jalur yang punya waiter prioritas.
+- **Adil per key + prioritas** ([decisions.md #27](decisions.md#27-kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)): `_Lane.next_waiter()` memilih minimum `(-priority, running_by_owner[owner], enqueued_at)`. `waiters` tetap berurutan sesuai kedatangan (untuk `oldest_wait_s`); `position()` mengurutkan dengan kunci yang sama.
+- **Jalur cepat prioritas** ([decisions.md #28](decisions.md#28-jalur-cepat-key-prioritas-slot-cadangan-dan-gantian-model-seketika)):
+  - `_grantable()`: request biasa hanya boleh dijalankan bila `running < capacity - _reserved(lane)`, sedangkan `_reserved` = `reserved_slots` untuk jalur dengan kapasitas lebih besar;
+  - `enqueue()` hanya menolak request biasa saat antrean penuh (`_normal_waiting()`);
+  - `_yielding()` langsung `True` bila jalur lain punya waiter dengan prioritas lebih tinggi daripada waiter jalur aktif;
+  - batas tunggu prioritas diberikan `proxy._enqueue` (`PRIORITY_QUEUE_TIMEOUT_S`).
+- **Kuota lunak di memori**: `QuotaTracker` diisi dari DB per key per periode, lalu ditambah `Finalizer` tepat saat request selesai, sehingga tidak bergantung pada `UsageWriter` yang asinkron.
 - **Allowlist, bukan denylist**, untuk field request.
 - **Background tasks** lewat `Gateway.spawn()`, yang menyimpan referensi task dan membatalkannya saat stop.
 - **Write-behind queue** untuk usage (`UsageWriter`).
