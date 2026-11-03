@@ -143,7 +143,8 @@ function logout(message) {
 }
 
 // ---------- Navigation & polling ----------
-const VIEWS = { overview: loadOverview, keys: loadKeys, usage: loadUsage, requests: loadRequests, models: loadModels };
+const VIEWS = { overview: loadOverview, keys: loadKeys, usage: loadUsage, requests: loadRequests,
+  prompts: () => loadPrompts(), models: loadModels };
 function showView(name) {
   if (!VIEWS[name]) name = "overview";
   state.view = name;
@@ -335,9 +336,135 @@ function tip(e, text) {
 }
 
 // ---------- API keys ----------
+// ---------- Key policy: token quota, expiry, models, priority ----------
+const pad2 = (n) => String(n).padStart(2, "0");
+// expires_at is the first moment the key is no longer valid; people think in "last valid day".
+const lastValidDay = (iso) => new Date(new Date(iso).getTime() - 1000);
+function dateInputValue(iso) {
+  if (!iso) return "";
+  const d = lastValidDay(iso);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+const dayLabel = (iso) => lastValidDay(iso).toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" });
+const intOrNull = (v) => (v ? Number(v) : null);
+function policyFields(k = {}) {
+  const uid = k.id ? `p${k.id}` : "pnew";
+  const daily = h("input", { type: "number", min: 1, inputmode: "numeric", id: `${uid}-daily`, placeholder: "tanpa batas", value: k.daily_token_limit ?? "" });
+  const monthly = h("input", { type: "number", min: 1, inputmode: "numeric", id: `${uid}-monthly`, placeholder: "tanpa batas", value: k.monthly_token_limit ?? "" });
+  const expires = h("input", { type: "date", id: `${uid}-expires`, value: dateInputValue(k.expires_at) });
+  const allowed = k.allowed_models || [];
+  const boxes = [...new Set([...state.info.models, ...allowed])].map((m) =>
+    h("input", { type: "checkbox", value: m, checked: allowed.includes(m) }));
+  const priority = h("input", { type: "checkbox", id: `${uid}-priority`, checked: (k.priority || 0) > 0 });
+  const logPrompts = h("input", { type: "checkbox", id: `${uid}-logprompts`, checked: k.log_prompts !== 0 });
+  const nodes = [
+    h("div", { class: "form-row" },
+      h("div", { class: "field" }, h("label", { for: daily.id }, "Kuota token / hari"), daily),
+      h("div", { class: "field" }, h("label", { for: monthly.id }, "Kuota token / bulan"), monthly),
+      h("div", { class: "field" }, h("label", { for: expires.id }, "Berlaku sampai (hari terakhir)"), expires)),
+    h("fieldset", { class: "models-pick" }, h("legend", {}, "Model yang boleh dipakai"),
+      ...boxes.map((b) => h("label", { class: "check" }, b, b.value)),
+      h("p", { class: "hint" }, "Tidak ada yang dicentang berarti semua model aktif boleh dipakai.")),
+    h("label", { class: "check" }, priority, "Prioritas: didahulukan di antrean GPU"),
+    h("label", { class: "check" }, logPrompts, "Catat prompt & jawaban (menu Prompt)"),
+    h("p", { class: "hint" }, "Kuota menghitung total token (input + output) dan reset pukul 00:00 / tanggal 1 waktu server. " +
+      "Kuota bersifat lunak: request yang sedang berjalan boleh melewati sisanya."),
+  ];
+  const read = () => {
+    const picked = boxes.filter((b) => b.checked).map((b) => b.value);
+    return {
+      daily_token_limit: intOrNull(daily.value), monthly_token_limit: intOrNull(monthly.value),
+      expires_at: expires.value || null, allowed_models: picked.length ? picked : null,
+      priority: priority.checked ? Math.max(1, k.priority || 0) : 0,
+      log_prompts: logPrompts.checked ? null : false,
+    };
+  };
+  // For editing: only the fields the admin actually changed, so an untouched datetime expiry is not
+  // rounded to a whole day and a list naming a since-deleted model does not block other edits.
+  const initial = {
+    daily_token_limit: k.daily_token_limit ?? null, monthly_token_limit: k.monthly_token_limit ?? null,
+    expires_at: dateInputValue(k.expires_at) || null, allowed_models: allowed.length ? allowed : null,
+    priority: k.priority || 0, log_prompts: k.log_prompts === 0 ? false : null,
+  };
+  const same = (a, b) => (Array.isArray(a) || Array.isArray(b)
+    ? [...(a || [])].sort().join("\n") === [...(b || [])].sort().join("\n") : a === b);
+  const changed = () => Object.fromEntries(Object.entries(read()).filter(([f, v]) => !same(v, initial[f])));
+  return { nodes, read, changed, models: state.info.models.join("\n") };
+}
+const quotaUsedUp = (k) =>
+  (k.daily_token_limit != null && k.usage.day_tokens >= k.daily_token_limit) ||
+  (k.monthly_token_limit != null && k.usage.month_tokens >= k.monthly_token_limit);
+function keyStatus(k) {
+  if (k.revoked_at) return statusBadge("absent", "Dicabut");
+  if (k.expired) return statusBadge("down", "Kedaluwarsa");
+  if (quotaUsedUp(k)) return statusBadge("warn", "Kuota habis");
+  return statusBadge("ok", "Aktif");
+}
+function limitsCell(k) {
+  const dflt = (set) => (set ? "" : h("span", { class: "muted" }, " (default)"));
+  return [h("div", {}, `${num(k.rpm_limit_effective)}/menit`, dflt(k.rpm_limit)),
+    h("div", {}, `${num(k.max_concurrent_effective)} paralel`, dflt(k.max_concurrent))];
+}
+function quotaCell(k) {
+  const u = k.usage || { day_tokens: 0, month_tokens: 0 };
+  const rows = [["Hari ini", u.day_tokens, k.daily_token_limit], ["Bulan ini", u.month_tokens, k.monthly_token_limit]]
+    .filter(([, , limit]) => limit != null);
+  if (!rows.length) return h("span", { class: "muted" }, `Tanpa batas · hari ini ${num(u.day_tokens)}`);
+  return h("div", { class: "quota" }, ...rows.map(([label, used, limit]) => {
+    const bar = h("span", { class: used >= limit ? "full" : "" });
+    bar.style.width = `${Math.min(100, (used / limit) * 100)}%`;
+    return h("div", {}, `${label}: ${num(used)} / ${num(limit)}`, h("span", { class: "progress", "aria-hidden": "true" }, bar));
+  }));
+}
+function accessCell(k) {
+  return [h("div", {}, k.allowed_models ? k.allowed_models.join(", ") : "Semua model"),
+    k.expires_at ? h("div", { class: "muted" }, `${k.expired ? "Berakhir" : "Berlaku s.d."} ${dayLabel(k.expires_at)}`) : "",
+    k.priority > 0 ? h("span", { class: "tag" }, "Prioritas") : "",
+    k.log_prompts === 0 ? h("span", { class: "tag muted-tag" }, "Prompt tidak dicatat") : ""];
+}
+function clientMessage(k, key) {
+  const base = state.info.public_base_url || "<URL dari penyedia>";
+  const models = k.allowed_models || state.info.models;
+  const quota = [k.daily_token_limit != null && `${num(k.daily_token_limit)} token/hari`,
+    k.monthly_token_limit != null && `${num(k.monthly_token_limit)} token/bulan`].filter(Boolean);
+  const lines = [
+    "Akses API LLM (kompatibel OpenAI)", "",
+    `Base URL : ${base}`,
+    `API key  : ${key || "(key yang sudah diberikan sebelumnya)"}`,
+    `Model    : ${models.join(", ")}`,
+    `Batas    : ${k.rpm_limit_effective} request/menit, ${k.max_concurrent_effective} request bersamaan`,
+  ];
+  if (quota.length) lines.push(`Kuota    : ${quota.join(", ")} (reset 00:00 / tanggal 1 WIB)`);
+  if (k.expires_at) lines.push(`Berlaku  : sampai ${dayLabel(k.expires_at)}`);
+  lines.push("", "Rahasiakan API key ini. Contoh Python (pip install openai):", "",
+    "from openai import OpenAI",
+    `client = OpenAI(base_url="${base}", api_key="${key || "sk-..."}")`,
+    `r = client.chat.completions.create(model="${models[0] || "gemma3:4b"}", messages=[{"role": "user", "content": "Halo!"}])`,
+    "print(r.choices[0].message.content)");
+  if (state.info.client_guide_url) lines.push("", `Panduan lengkap: ${state.info.client_guide_url}`);
+  return lines.join("\n");
+}
+function showClientMessage(k) {
+  const msg = clientMessage(k, null);
+  showDialog(`Pesan untuk ${k.name}`, [
+    h("p", { class: "hint" }, "Key asli tidak bisa ditampilkan lagi; pesan ini merujuk ke key yang sudah diberikan."),
+    h("pre", { class: "code wrap" }, msg),
+  ], [
+    { label: "Salin pesan", onClick: () => { copy(msg, "Pesan"); return false; } },
+    { label: "Tutup", kind: "primary" },
+  ]);
+}
+
+function resetNewPolicy() {
+  state.newPolicy = policyFields();
+  $("#key-policy").replaceChildren(...state.newPolicy.nodes);
+}
 async function loadKeys() {
   const d = state.info.defaults;
   $("#key-defaults").textContent = `Kosongkan batas untuk memakai default: ${d.rpm} request/menit dan ${d.max_concurrent} request paralel.`;
+  // Built once (and again only when the model list changes or after a key is created), so a
+  // half-filled form survives refreshes such as returning to the browser tab.
+  if (!state.newPolicy || state.newPolicy.models !== state.info.models.join("\n")) resetNewPolicy();
   const res = await api("/admin/keys?include_revoked=true");
   state.keys = res.data;
   renderKeys();
@@ -347,19 +474,22 @@ function renderKeys() {
   const rows = state.keys.filter((k) => showRevoked || !k.revoked_at);
   const tbody = $("#keys-table tbody");
   if (!rows.length) {
-    tbody.replaceChildren(h("tr", {}, h("td", { class: "empty", colspan: 7 },
+    tbody.replaceChildren(h("tr", {}, h("td", { class: "empty", colspan: 8 },
       "Belum ada key aktif. Buat key pertama di atas, lalu berikan ke client.")));
     return;
   }
   tbody.replaceChildren(...rows.map((k) => h("tr", { class: k.revoked_at ? "revoked" : "" },
     h("td", {}, k.name),
     h("td", { class: "mono" }, `${k.prefix}…`),
-    h("td", { class: "num" }, num(k.rpm_limit_effective), k.rpm_limit ? "" : " (default)"),
-    h("td", { class: "num" }, num(k.max_concurrent_effective), k.max_concurrent ? "" : " (default)"),
+    h("td", {}, limitsCell(k)),
+    h("td", {}, quotaCell(k)),
+    h("td", {}, accessCell(k)),
     h("td", { title: time(k.last_used_at) }, ago(k.last_used_at)),
-    h("td", {}, k.revoked_at ? statusBadge("absent", "Dicabut") : statusBadge("ok", "Aktif")),
+    h("td", {}, keyStatus(k)),
     h("td", { class: "actions" }, k.revoked_at ? "" : [
-      h("button", { type: "button", class: "btn small", onclick: () => editKey(k) }, "Ubah batas"),
+      h("button", { type: "button", class: "btn small", onclick: () => editKey(k) }, "Ubah"),
+      " ",
+      h("button", { type: "button", class: "btn small", onclick: () => showClientMessage(k) }, "Pesan"),
       " ",
       h("button", { type: "button", class: "btn small danger", onclick: () => revokeKey(k) }, "Cabut"),
     ]),
@@ -371,13 +501,18 @@ async function createKey(e) {
   const rpm = $("#key-rpm").value, conc = $("#key-conc").value;
   try {
     const k = await api("/admin/keys", { method: "POST", body: {
-      name, rpm_limit: rpm ? Number(rpm) : null, max_concurrent: conc ? Number(conc) : null } });
+      name, rpm_limit: intOrNull(rpm), max_concurrent: intOrNull(conc), ...state.newPolicy.read() } });
     e.target.reset();
+    resetNewPolicy();
+    const msg = clientMessage(k, k.key);
     showDialog(`Key untuk ${k.name} sudah dibuat`, [
       h("p", {}, "Salin dan simpan sekarang. Key ini tidak akan ditampilkan lagi."),
       h("div", { class: "secret" }, k.key),
+      h("p", { class: "hint" }, "Pesan siap kirim untuk client (berisi key, jadi kirim lewat jalur pribadi):"),
+      h("pre", { class: "code wrap" }, msg),
     ], [
-      { label: "Salin key", kind: "", onClick: () => { copy(k.key, "Key"); return false; } },
+      { label: "Salin key", onClick: () => { copy(k.key, "Key"); return false; } },
+      { label: "Salin pesan", onClick: () => { copy(msg, "Pesan"); return false; } },
       { label: "Sudah disimpan", kind: "primary" },
     ]);
     await loadKeys();
@@ -386,18 +521,21 @@ async function createKey(e) {
 function editKey(k) {
   const rpm = h("input", { type: "number", min: 1, max: 100000, id: "edit-rpm", value: k.rpm_limit ?? "" });
   const conc = h("input", { type: "number", min: 1, max: 64, id: "edit-conc", value: k.max_concurrent ?? "" });
+  const policy = policyFields(k);
   const d = state.info.defaults;
-  showDialog(`Ubah batas ${k.name}`, [
-    h("div", { class: "field" }, h("label", { for: "edit-rpm" }, "Batas request per menit"), rpm),
-    h("div", { class: "field" }, h("label", { for: "edit-conc" }, "Request paralel"), conc),
+  showDialog(`Ubah key ${k.name}`, [
+    h("div", { class: "form-row" },
+      h("div", { class: "field" }, h("label", { for: "edit-rpm" }, "Batas request per menit"), rpm),
+      h("div", { class: "field" }, h("label", { for: "edit-conc" }, "Request paralel"), conc)),
     h("p", { class: "hint" }, `Kosongkan untuk memakai default (${d.rpm}/menit, ${d.max_concurrent} paralel).`),
+    ...policy.nodes,
   ], [
     { label: "Batal" },
     { label: "Simpan perubahan", kind: "primary", onClick: async () => {
       try {
         await api(`/admin/keys/${k.id}`, { method: "PATCH", body: {
-          rpm_limit: rpm.value ? Number(rpm.value) : null, max_concurrent: conc.value ? Number(conc.value) : null } });
-        toast(`Batas ${k.name} disimpan`);
+          rpm_limit: intOrNull(rpm.value), max_concurrent: intOrNull(conc.value), ...policy.changed() } });
+        toast(`Key ${k.name} disimpan`);
         await loadKeys();
       } catch (err) { handleError(err); return false; }
     } },
@@ -476,6 +614,109 @@ async function loadRequests() {
     h("td", { class: "num" }, ms(r.latency_ms)),
     h("td", { class: "mono" }, r.client_ip ?? "–"),
   )));
+}
+
+// ---------- Prompt log ----------
+// Kept light on purpose: a bounded time range, 50 rows per page, previews only (full text is fetched
+// per row), no auto-refresh, and at most PROMPT_MAX_ROWS rows in the table.
+const PROMPT_RANGE_DAYS = { "1h": 1 / 24, "24h": 1, "7d": 7, "30d": 30 };
+const PROMPT_MAX_ROWS = 500;
+const ROLE_TEXT = { system: "Sistem", user: "User", assistant: "Asisten", tool: "Hasil tool", tools: "Daftar tools",
+  prompt: "Prompt", input: "Input" };
+state.prompts = { rows: [], next: null, params: null, seq: 0 };
+function fillPromptSelects() {
+  const keySel = $("#pf-key"), modelSel = $("#pf-model");
+  const keyVal = keySel.value, modelVal = modelSel.value;
+  keySel.replaceChildren(h("option", { value: "" }, "Semua key"),
+    ...state.keys.map((k) => h("option", { value: String(k.id) }, k.revoked_at ? `${k.name} (dicabut)` : k.name)));
+  modelSel.replaceChildren(h("option", { value: "" }, "Semua model"),
+    ...state.info.models.map((m) => h("option", { value: m }, m)));
+  keySel.value = keyVal;
+  modelSel.value = modelVal;
+}
+function promptParams() {
+  const days = PROMPT_RANGE_DAYS[$("#pf-range").value] ?? 1;
+  const p = new URLSearchParams({ since: new Date(Date.now() - days * 864e5).toISOString(), limit: "50" });
+  if ($("#pf-key").value) p.set("key_id", $("#pf-key").value);
+  if ($("#pf-model").value) p.set("model", $("#pf-model").value);
+  if ($("#pf-status").value !== "all") p.set("status", $("#pf-status").value);
+  const q = $("#pf-q").value.trim();
+  if (q) p.set("q", q);
+  return p;
+}
+async function loadPrompts(more = false) {
+  const seq = ++state.prompts.seq; // a newer load (e.g. a filter change) makes this one's answer stale
+  if (!state.keys.length) state.keys = (await api("/admin/keys?include_revoked=true")).data;
+  if (!more) {
+    fillPromptSelects();
+    const q = $("#pf-q").value.trim();
+    if (q && q.length < 3) { toast("Kata pencarian minimal 3 huruf.", true); return; }
+    state.prompts.params = promptParams();
+  }
+  const params = new URLSearchParams(state.prompts.params);
+  if (more && state.prompts.next) params.set("before", state.prompts.next);
+  const moreBtn = $("#prompts-more");
+  moreBtn.disabled = true;
+  let res;
+  try {
+    res = await api(`/admin/prompts?${params}`);
+  } finally {
+    moreBtn.disabled = false;
+  }
+  if (seq !== state.prompts.seq) return;
+  state.prompts.rows = more ? [...state.prompts.rows, ...res.data] : res.data;
+  state.prompts.next = res.next;
+  $("#prompt-note").textContent = res.enabled
+    ? `Prompt & jawaban disimpan ${res.retention_days} hari dan hanya terlihat di dashboard admin. Daftar berisi cuplikan; klik "Lihat" untuk isi lengkap.`
+    : "Pencatatan prompt sedang dimatikan (PROMPT_LOG_ENABLED=false). Yang tampil hanya catatan lama.";
+  renderPrompts();
+}
+function clipped(text) {
+  return text ? h("span", { class: "clip", title: text }, text) : h("span", { class: "muted" }, "–");
+}
+function renderPrompts() {
+  const rows = state.prompts.rows;
+  const tbody = $("#prompts-table tbody");
+  tbody.replaceChildren(...(rows.length ? rows.map((r) => h("tr", {},
+    h("td", {}, time(r.ts)),
+    h("td", {}, r.key_name ?? `#${r.key_id}`),
+    h("td", {}, h("div", { class: "mono" }, r.client_ip ?? "–"), r.end_user ? h("div", { class: "muted" }, r.end_user) : ""),
+    h("td", {}, r.model ?? "–"),
+    h("td", {}, statusOf(r.status_code)),
+    h("td", { class: "num" }, num(r.total_tokens)),
+    h("td", {}, clipped(r.prompt_preview)),
+    h("td", {}, clipped(r.response_preview)),
+    h("td", { class: "actions" }, h("button", { type: "button", class: "btn small", onclick: () => showPrompt(r.id) }, "Lihat")),
+  )) : [h("tr", {}, h("td", { class: "empty", colspan: 9 }, "Tidak ada prompt untuk filter ini."))]));
+  const full = rows.length >= PROMPT_MAX_ROWS;
+  $("#prompts-more").hidden = !state.prompts.next || full;
+  $("#prompts-count").textContent = rows.length
+    ? `${num(rows.length)} prompt ditampilkan` + (full && state.prompts.next ? " (batas tampilan; persempit filter untuk melihat yang lain)" : "")
+    : "";
+}
+async function showPrompt(id) {
+  try {
+    const p = await api(`/admin/prompts/${id}`);
+    const meta = [["Waktu", time(p.ts)], ["Key", p.key_name ?? `#${p.key_id}`], ["IP", p.client_ip ?? "–"],
+      ["User (dari client)", p.end_user ?? "–"], ["Model", p.model ?? "–"],
+      ["Endpoint", (ENDPOINT_TEXT[p.endpoint] || p.endpoint) + (p.stream ? " (stream)" : "")],
+      ["Status", String(p.status_code)], ["Token", num(p.total_tokens)], ["Request ID", p.request_id ?? "–"]];
+    const asText = p.prompt.map((m) => `[${ROLE_TEXT[m.role] || m.role}]\n${m.content}`).join("\n\n") +
+      `\n\n[Jawaban]\n${p.response ?? "(tidak ada)"}`;
+    showDialog(`Prompt dari ${p.key_name ?? "key #" + p.key_id}`, [
+      h("dl", { class: "meta" }, ...meta.map(([dt, dd]) => h("div", {}, h("dt", {}, dt), h("dd", {}, dd)))),
+      ...p.prompt.map((m) => h("div", { class: "msg" }, h("div", { class: "msg-role" }, ROLE_TEXT[m.role] || m.role),
+        h("pre", { class: "code wrap" }, m.content || "(kosong)"))),
+      h("div", { class: "msg" }, h("div", { class: "msg-role" }, "Jawaban model"),
+        h("pre", { class: "code wrap" }, p.response ?? (p.status_code >= 400 ? "(ditolak sebelum sampai ke model)" : "(tidak ada)"))),
+    ], [
+      { label: "Salin teks", onClick: () => { copy(asText, "Prompt"); return false; } },
+      { label: "Tutup", kind: "primary" },
+    ]);
+    const dlg = $("#dialog");
+    dlg.classList.add("wide");
+    dlg.addEventListener("close", () => dlg.classList.remove("wide"), { once: true });
+  } catch (err) { handleError(err); }
 }
 
 // ---------- Models ----------
@@ -571,9 +812,16 @@ function init() {
   $("#show-revoked").addEventListener("change", renderKeys);
   $("#pull-form").addEventListener("submit", pullModel);
   $("#only-errors").addEventListener("change", () => loadRequests().catch(handleError));
+  $("#prompt-filter").addEventListener("submit", (e) => { e.preventDefault(); loadPrompts().catch(handleError); });
+  $("#prompts-more").addEventListener("click", () => loadPrompts(true).catch(handleError));
   setupSegmented("#usage-range", "range", (v) => { state.usageRange = Number(v); loadUsage().catch(handleError); });
   setupSegmented("#usage-group", "group", (v) => { state.usageGroup = v; loadUsage().catch(handleError); });
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.key) refresh(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || !state.key) return;
+    // The Prompt view keeps the pages already loaded; only the status bar is refreshed.
+    if (state.view === "prompts") loadStatus().catch(handleError);
+    else refresh();
+  });
 
   let saved = null;
   try { saved = sessionStorage.getItem(KEY_STORE); } catch { /* ignore */ }
