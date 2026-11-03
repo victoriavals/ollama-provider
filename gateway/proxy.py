@@ -13,9 +13,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from .auth import ApiKey
-from .db import UsageRecord
+from .db import PromptRecord, UsageRecord, utcnow
 from .errors import APIError, error_body
 from .ollama import upstream_unavailable
+from .promptlog import ResponseCollector
 from .scheduler import Ticket
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ class RequestContext:
     rate_headers: dict[str, str] = field(default_factory=dict)
     access: dict[str, Any] = field(default_factory=dict)  # request.state.access (access-log fields)
     gpu_capacity: int | None = None  # parallel slots of this model (scheduler.resolve_capacity)
+    prompt: PromptRecord | None = None  # prompt-log row, completed by the Finalizer (None: not logged)
+    prompt_tokens_est: int = 0  # rough prompt size, used when a stream ends before Ollama reports usage
 
 
 class Finalizer:
@@ -48,6 +51,9 @@ class Finalizer:
             key_id=ctx.key.id, endpoint=ctx.endpoint, model=ctx.model, status_code=200,
             request_id=ctx.request_id, stream=stream, client_ip=ctx.client_ip,
         )
+        max_chars = gw.settings.prompt_log_max_chars
+        self.response = ResponseCollector(max_chars) if ctx.prompt is not None else None
+        self.chunks = 0  # stream chunks carrying output (~1 token each in Ollama)
         self._done = False
 
     def __call__(self) -> None:
@@ -60,7 +66,22 @@ class Finalizer:
         self.gw.gate.release_key(self.ctx.key.id)
         rec = self.record
         rec.latency_ms = int((time.monotonic() - self.ctx.started) * 1000)
+        if rec.stream and rec.total_tokens is None and self.chunks:
+            # The stream ended (client left, upstream broke) before the final usage chunk: estimate,
+            # so the request still counts towards usage and the key's token quota.
+            rec.prompt_tokens, rec.completion_tokens = self.ctx.prompt_tokens_est, self.chunks
+            rec.total_tokens = rec.prompt_tokens + rec.completion_tokens
         self.gw.usage.submit(rec)
+        self.gw.quota.add(rec.key_id, rec.total_tokens, rec.ts)
+        if self.ctx.prompt is not None:
+            p = self.ctx.prompt
+            p.status_code, p.total_tokens, p.stream = rec.status_code, rec.total_tokens, rec.stream
+            try:
+                p.response = self.response.text()
+            except Exception:  # never let the audit log break the Finalizer
+                p.response = None
+            p.ts = utcnow()
+            self.gw.usage.submit(p)
         # The access log records the real outcome (a stream can end in 499/503 after a 200 header).
         self.ctx.access.update(
             status=rec.status_code, stream=rec.stream, prompt_tokens=rec.prompt_tokens,
@@ -88,6 +109,23 @@ class ClosingStreamingResponse(StreamingResponse):
             self._on_close()
 
 
+def _collect(add: Callable[[Any], None], data: Any) -> None:
+    """Feed the prompt log's answer collector; odd upstream data must never break the response."""
+    try:
+        add(data)
+    except Exception:
+        log.debug("prompt log: could not read part of the answer", exc_info=True)
+
+
+def _has_output(chunk: dict[str, Any]) -> bool:
+    for choice in chunk.get("choices") or []:
+        if isinstance(choice, dict):
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            if delta.get("content") or delta.get("tool_calls") or delta.get("reasoning") or choice.get("text"):
+                return True
+    return False
+
+
 def server_busy(reason: str = "no GPU slot became free in time", retry_after: int = 5) -> APIError:
     return APIError(503, f"Server is busy: {reason}. Please retry shortly.",
                     type_="server_error", code="server_busy", headers={"Retry-After": str(retry_after)})
@@ -98,7 +136,9 @@ RESTARTING = {"reason": "the server is restarting", "retry_after": 15}  # a rest
 
 def _enqueue(gw: "Gateway", fin: Finalizer) -> None:
     """Take a place in the GPU queue (owned by the Finalizer); 503 at once when the queue is full."""
-    fin.ticket = gw.scheduler.enqueue(fin.ctx.model, fin.ctx.gpu_capacity, gw.settings.queue_timeout_s)
+    key, s = fin.ctx.key, gw.settings
+    timeout = s.priority_queue_timeout_s if key.priority > 0 else s.queue_timeout_s
+    fin.ticket = gw.scheduler.enqueue(fin.ctx.model, fin.ctx.gpu_capacity, timeout, owner=key.id, priority=key.priority)
     if fin.ticket is None:
         raise server_busy(**RESTARTING) if gw.scheduler.closed else server_busy("the request queue is full")
 
@@ -148,6 +188,8 @@ async def forward_json(gw: "Gateway", path: str, payload: dict[str, Any], ctx: R
         fin.record.status_code = resp.status_code
         if resp.status_code == 200 and isinstance(data, dict):
             fin.record.set_usage(data.get("usage"))
+            if fin.response is not None:
+                _collect(fin.response.add_json, data)
         elif resp.status_code >= 400:
             ctx.access.setdefault("error", "upstream_error")
         return JSONResponse(data, status_code=resp.status_code, headers=ctx.rate_headers)
@@ -207,6 +249,11 @@ async def _sse(gw: "Gateway", path: str, payload: dict[str, Any], include_usage:
                             chunk = json.loads(data)
                         except ValueError:
                             chunk = None
+                        if isinstance(chunk, dict):
+                            if _has_output(chunk):
+                                fin.chunks += 1
+                            if fin.response is not None:
+                                _collect(fin.response.add_chunk, chunk)
                         if isinstance(chunk, dict) and chunk.get("usage") and not chunk.get("choices"):
                             fin.record.set_usage(chunk["usage"])
                             if not include_usage:
