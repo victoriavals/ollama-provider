@@ -18,7 +18,7 @@
 | Upstream | Ollama (`http://127.0.0.1:11434`), memakai endpoint OpenAI-compat `/v1/*` dan native `/api/*` |
 | Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Ollama 0.40.5, Windows Service via **WinSW v2.12**, tunnel publik **ngrok** (gratis, aktif). Cloudflare Tunnel tersedia sebagai alternatif berbayar |
 | Package manager | `uv` (`uv.lock`) |
-| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **112 test** |
+| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **155 test** |
 | Bahasa dokumentasi | Indonesia (README, `.agents/`), komentar kode dalam Bahasa Inggris |
 
 ## Arsitektur singkat
@@ -46,7 +46,7 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 | Model | `gemma3:4b` (utama, dimuat saat start) + `qwen3.5:4b` (tools/JSON, sejak 2026-10-17). Masing-masing 100% GPU; hanya satu dimuat sekaligus (`OLLAMA_MAX_LOADED_MODELS=1`). `qwen3.5:9b` diuji lalu dihapus (87% GPU, 41 tok/dtk) |
 | Git | Branch `main`, remote publik `github.com/victoriavals/ollama-provider`. Agent Codex juga bekerja di repo ini: cek `.git/*.lock` dan proses `codex` sebelum operasi git |
 | Tray app Ollama (milik user Windows "User") | Autostart dimatikan (`Ollama.lnk` → `Ollama.lnk.disabled`), tidak di-uninstall |
-| API key client | 1 key aktif (milik pemilik, dipakai dari luar lewat ngrok); key lain adalah key uji yang sudah dicabut |
+| API key client | 1 key aktif: `naufalnaufal` (id 7, milik pemilik, dipakai dari luar lewat ngrok). Sejak 2026-10-18 atas permintaan pemilik: 100.000 request/menit, 64 paralel, tanpa kuota/masa berlaku/batasan model, **prioritas 9**. Key lain adalah key uji yang sudah dicabut |
 | Reboot | Teruji 2026-10-17: Windows Update me-restart PC, semua service pulih otomatis tanpa login |
 
 ## Pengetahuan kritis (jebakan yang pernah terjadi)
@@ -70,6 +70,36 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 17. **Model berpikir (qwen3.5) berpikir secara default** dan bisa menghabiskan seluruh `max_tokens` sebelum menjawab (7/10 jawaban kosong di uji). Gateway menyuntik `reasoning_effort` = `DEFAULT_REASONING_EFFORT` (default `none`) untuk model ber-capability `thinking`; nilai client divalidasi (`none`/`medium`/`high`; `low` ditolak karena selalu macet sampai batas token). `/v1/completions` ditolak untuk model berpikir (Ollama mengembalikan teks kosong). Warm-up memilih model aktif pertama secara alfabet (= `gemma3:4b`).
 18. **Akses SSH pemilik lewat Tailscale bergantung pada login user "User".** Profil Tailscale terikat ke akun "User" dan *Run unattended* (ForceDaemon) tidak aktif; `AutoAdminLogon=0`. Setelah restart oleh Windows Update, "User" otomatis login (kemungkinan fitur sign-in otomatis pasca-update) sehingga Tailscale tersambung. Restart manual tidak menjamin itu, jadi bisa memutus SSH pemilik dari jauh. Jangan me-restart PC dari jauh sebelum *Run unattended* diaktifkan dari akun "User". Service API (ngrok) tetap pulih tanpa login.
 19. **`qwen3.5:4b` tidak bisa paralel di Ollama 0.40.5.** Arsitektur hibrida `qwen35` (sebagian layer rekuren) dipaksa 1 slot (log: `model architecture does not currently support parallel requests`, `n_seq_max = 1`), sedangkan `gemma3:4b` mendapat 4 slot. Gateway tetap meloloskan 4 request qwen ke Ollama: 3 antre di dalam Ollama (tidak dibatasi `QUEUE_TIMEOUT_S`) sambil memegang slot global yang sebenarnya bisa dipakai gemma. Beban campuran dua model memicu muat ulang ~4 dtk berkali-kali. **Sejak 2026-10-18 diatasi `GpuScheduler`** (`scheduler.py`, [decisions.md #26](decisions.md#26-scheduler-gpu-sadar-model-in-process)): kapasitas qwen 1 lewat `SERIAL_ARCHITECTURES=qwen35`, satu model memegang GPU per giliran, dan semua antrean terjadi di gateway. Setelah upgrade Ollama, cek ulang log tersebut. Angka lengkap: [operations.md#kapasitas](operations.md#kapasitas).
+20. **Kolom baru `api_keys` lewat migrasi aditif** (`KEY_MIGRATIONS` di `db.py`, sejak 2026-10-18). Migrasi berjalan di setiap proses yang membuka DB, **termasuk CLI**, jadi backup dulu (`POST /admin/backup`) sebelum menjalankan kode versi baru. Kolom baru wajib nullable atau punya `DEFAULT`. `allowed_models` disimpan sebagai JSON, tetapi `db.py` mengembalikannya sebagai `list[str] | None`.
+21. **Kebijakan per key** ([decisions.md #27](decisions.md#27-kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)):
+    - Kuota token bersifat lunak dan in-memory (`QuotaTracker`). Nilai awal diambil dari `usage_logs` per key per periode, lalu ditambah oleh `Finalizer`; endpoint generasi baru wajib lewat `Finalizer` agar tokennya terhitung.
+    - Periode mengikuti **waktu lokal mesin** (WIB), sedangkan `usage_logs.ts` tetap UTC.
+    - `expires_at` = saat pertama key **tidak** berlaku.
+    - Model terlarang dibalas 404 (bukan 403).
+    - Antrean dalam satu jalur tidak lagi FIFO: prioritas → key dengan request berjalan paling sedikit → paling lama.
+    - Key prioritas (> 0, [decisions.md #28](decisions.md#28-jalur-cepat-key-prioritas-slot-cadangan-dan-gantian-model-seketika)):
+      - mendapat `PRIORITY_RESERVED_SLOTS` (1 slot gemma; jalur 1 slot tidak disisihkan);
+      - tidak ditolak karena antrean penuh, batas tunggunya `PRIORITY_QUEUE_TIMEOUT_S`;
+      - membuat model lain langsung gantian.
+
+      Test memakai `priority_reserved_slots=0` (conftest) kecuali test yang mengujinya; `hold_slots()` tanpa itu tidak bisa mengisi slot cadangan.
+22. **Log prompt & jawaban** (sejak 2026-11-03, [decisions.md #29](decisions.md#29-log-prompt--jawaban-untuk-audit), atas permintaan pemilik untuk audit akses).
+    - **Penangkapan:** isi ditangkap di `_generate` setelah body terbaca (`promptlog.new_record`), lalu dilengkapi `Finalizer` (status, token, jawaban dari `ResponseCollector`). Request yang ditolak setelah body terbaca juga tercatat. Penulisan lewat `UsageWriter` yang sama (batch, async).
+    - **Privasi:**
+      - gambar → `[gambar ~N KB]`;
+      - teks dipotong di `PROMPT_LOG_MAX_CHARS`;
+      - `mask_secrets` untuk `sk-...`;
+      - per key `log_prompts` (default 1);
+      - global `PROMPT_LOG_ENABLED`;
+      - retensi `PROMPT_LOG_RETENTION_DAYS` (30) di `_prune_loop`.
+    - **Dashboard:** `/admin/prompts` selalu dibatasi rentang waktu (default 24 jam), `LIMIT` ≤ 100, kursor `ts|id`, dan hanya mengembalikan cuplikan; isi lengkap lewat `/admin/prompts/{id}`. Pencarian `q` (≥ 3 huruf) memakai `LIKE` dengan escape `%`/`_`. Jangan menambah auto-refresh di menu Prompt.
+    - `prompt_logs.ts` = waktu request **selesai**, sehingga urut dengan `id`. `CLIENT.md#privasi` memberi tahu client.
+    - **QA 2026-11-03** (review independen + uji live):
+      - `sanitize_chat` kini membangun ulang pesan, bagian konten, tool call, dan tools hanya dari kunci OpenAI yang persis. Ollama (Go) membaca kunci JSON tanpa peduli huruf besar-kecil, sehingga `"Content"` bisa lolos ke model tanpa diperiksa atau dicatat.
+      - Log disimpan dari payload yang sudah dibersihkan.
+      - Bacaan log prompt memakai **koneksi read-only kedua** (`Database._reader`, `mmap`), supaya pencarian berat tidak menahan query auth/allowlist milik request API (sebelumnya `/v1/models` 6 → 390 ms selama pencarian).
+      - Kursor halaman ditulis `ts <= ? AND (ts < ? OR id < ?)`, karena bentuk `OR` biasa memicu sort tabel sementara (200 ms per halaman pada 50 ribu baris).
+      - Stream yang terputus sebelum chunk usage kini diestimasi (token per chunk + perkiraan prompt) dan masuk kuota.
 
 ## Aturan wajib untuk AI Agent
 
@@ -80,7 +110,7 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 5. Tidak melakukan refactor besar tanpa analisis dampak, terutama pada `proxy.py`, `limits.py`, `middleware.py`, dan script service.
 6. Tidak menghapus fitur tanpa konfirmasi pemilik project.
 7. Menjaga backward compatibility: format API OpenAI, format error, nama field log JSON, schema DB, dan nama service Windows.
-8. Memperhatikan keamanan: jangan pernah mencatat header, body, atau API key, dan jangan mengekspos port 8001/11434. Lihat [conventions.md#aturan-keamanan](conventions.md#aturan-keamanan).
+8. Memperhatikan keamanan: jangan pernah mencatat header atau API key, jangan menulis body request/respons ke file log teks (isi prompt hanya lewat log prompt `prompt_logs`, #22), dan jangan mengekspos port 8001/11434. Lihat [conventions.md#aturan-keamanan](conventions.md#aturan-keamanan).
 9. Bertanya jika informasi tidak tersedia. Jangan menebak domain, akun Cloudflare, atau identitas client.
 10. Memperbarui dokumentasi (`.agents/`, README) ketika terjadi perubahan besar. Tambahkan entri di [decisions.md](decisions.md) untuk keputusan teknis baru.
 
@@ -98,7 +128,10 @@ Aturan operasional tambahan:
 | `gateway/apps/admin.py` | Admin API (port 8001) + audit log | |
 | `gateway/core.py` | Container `Gateway`, `PullManager`, warm-up, prune | |
 | `gateway/limits.py` | RPM, gagal-auth per IP, konkurensi per key | State in-memory |
-| `gateway/scheduler.py` | Antrean GPU sadar-model (`GpuScheduler`, `Ticket`, `resolve_capacity`) | State in-memory; ubah hanya lewat method sinkron. Ubah dengan hati-hati |
+| `gateway/scheduler.py` | Antrean GPU sadar-model (`GpuScheduler`, `Ticket`, `resolve_capacity`), adil per key + prioritas | State in-memory; ubah hanya lewat method sinkron. Ubah dengan hati-hati |
+| `gateway/quota.py` | Kuota token per key (`QuotaTracker`), `parse_expiry`, periode lokal | State in-memory |
+| `gateway/promptlog.py` | Log prompt & jawaban: `capture_prompt`, `new_record`, `ResponseCollector` | Aturan privasi (potong, gambar, `mask_secrets`) ada di sini |
+| `CLIENT.md` | Panduan untuk client (publik, tanpa domain/rahasia) | Perbarui bila batas/error/model berubah |
 | `gateway/sanitize.py` | Allowlist field & validasi request | Menjaga agar client tidak bisa mengubah VRAM/context |
 | `gateway/middleware.py` | Request id + access log JSON | Pure ASGI |
 | `gateway/health.py` | Health monitor dependency | |
