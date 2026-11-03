@@ -6,6 +6,13 @@ reload. So requests wait here, in one FIFO lane per model, and Ollama only recei
 run right away:
 
 - a lane admits at most its capacity (resolve_capacity), all lanes together at most global_limit;
+- within a lane the next request is the one with the highest priority, then the one whose owner
+  (API key) has the fewest requests running in that lane, then the oldest. A key that floods
+  the queue therefore cannot make other keys wait behind all of its requests;
+- priority requests (priority > 0) get extra room: reserved_slots of every lane with more slots
+  than that are kept for them, they are never rejected for a full queue, and a priority request
+  waiting for another model makes the running model yield at once (its running requests still
+  finish; nothing is preempted);
 - one model owns the GPU at a time (its "turn"). The turn stays with the model while it has
   waiters, even between requests, and passes to the model with the oldest waiter only once
   another model is waiting AND the turn is at least switch_after_s old (counted from the turn's
@@ -44,23 +51,36 @@ def resolve_capacity(settings: Settings, model: str, architecture: str | None) -
 
 
 class _Lane:
-    __slots__ = ("model", "capacity", "running", "waiters")
+    __slots__ = ("model", "capacity", "running", "running_by_owner", "waiters")
 
     def __init__(self, model: str, capacity: int):
         self.model = model
         self.capacity = capacity
         self.running = 0
-        self.waiters: deque[Ticket] = deque()
+        self.running_by_owner: dict[object, int] = {}
+        self.waiters: deque[Ticket] = deque()  # arrival order; selection order is _order()
+
+    def _order(self, ticket: "Ticket") -> tuple:
+        return (-ticket.priority, self.running_by_owner.get(ticket.owner, 0), ticket.enqueued_at)
+
+    def next_waiter(self) -> "Ticket":
+        return min(self.waiters, key=self._order)  # min() keeps arrival order on ties
+
+    def best_priority(self) -> int:
+        return max(t.priority for t in self.waiters)
 
 
 class Ticket:
     """One request's place in the scheduler. Its owner must call close() exactly when it ends."""
 
-    __slots__ = ("_sched", "lane", "state", "enqueued_at", "dequeued_at", "_future", "_timer")
+    __slots__ = ("_sched", "lane", "owner", "priority", "state", "enqueued_at", "dequeued_at", "_future", "_timer")
 
-    def __init__(self, sched: "GpuScheduler", lane: _Lane, now: float, future: asyncio.Future):
+    def __init__(self, sched: "GpuScheduler", lane: _Lane, now: float, future: asyncio.Future,
+                 owner: object = None, priority: int = 0):
         self._sched = sched
         self.lane = lane
+        self.owner = owner  # API key id (None: internal, e.g. warm-up)
+        self.priority = priority
         self.state = WAITING
         self.enqueued_at = now
         self.dequeued_at: float | None = None
@@ -96,10 +116,11 @@ class Ticket:
 
 class GpuScheduler:
     def __init__(self, global_limit: int, max_queue: int, switch_after_s: float,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, reserved_slots: int = 0):
         self.global_limit = max(1, global_limit)
         self.max_queue = max(0, max_queue)
         self.switch_after_s = max(0.0, switch_after_s)
+        self.reserved_slots = max(0, reserved_slots)
         self.clock = clock
         self._lanes: dict[str, _Lane] = {}
         self._turn: _Lane | None = None
@@ -109,10 +130,12 @@ class GpuScheduler:
         self.closed = False
         self.stats = {"granted": 0, "expired": 0, "rejected": 0, "switches": 0}
 
-    def enqueue(self, model: str, capacity: int | None, timeout: float) -> Ticket | None:
+    def enqueue(self, model: str, capacity: int | None, timeout: float,
+                owner: object = None, priority: int = 0) -> Ticket | None:
         """Queue a request for `model`; None when the queue is full or the scheduler is closed.
 
         capacity None keeps the lane's current capacity (global_limit for a new lane).
+        owner groups requests for fairness (the API key id); a higher priority goes first.
         """
         if self.closed:
             self.stats["rejected"] += 1
@@ -123,12 +146,12 @@ class GpuScheduler:
             lane = self._lanes[model] = _Lane(model, self.global_limit)
         if capacity is not None:
             lane.capacity = max(1, min(capacity, self.global_limit))
-        ticket = Ticket(self, lane, self.clock(), loop.create_future())
+        ticket = Ticket(self, lane, self.clock(), loop.create_future(), owner, priority)
         lane.waiters.append(ticket)
         self.waiting += 1
         self._dispatch()
         if ticket.state == WAITING:
-            if self.waiting > self.max_queue:
+            if priority <= 0 and self._normal_waiting() > self.max_queue:
                 self._leave_queue(ticket, CANCELLED)
                 self.stats["rejected"] += 1
                 self._dispatch()
@@ -151,7 +174,8 @@ class GpuScheduler:
         """1-based position within the ticket's lane, None once it left the queue."""
         if ticket.state != WAITING:
             return None
-        return ticket.lane.waiters.index(ticket) + 1
+        lane = ticket.lane
+        return sorted(lane.waiters, key=lane._order).index(ticket) + 1
 
     def snapshot(self) -> dict[str, Any]:
         now = self.clock()
@@ -164,13 +188,15 @@ class GpuScheduler:
             "active": self.active,
             "waiting": self.waiting,
             "closed": self.closed,
+            "reserved_slots": self.reserved_slots,
             "max_queue": self.max_queue,
             "switch_after_s": self.switch_after_s,
             "turn": turn,
             "lanes": [{
-                "model": lane.model, "capacity": lane.capacity, "running": lane.running,
+                "model": lane.model, "capacity": lane.capacity, "reserved": self._reserved(lane), "running": lane.running,
                 "waiting": len(lane.waiters),
                 "oldest_wait_s": round(now - lane.waiters[0].enqueued_at, 1) if lane.waiters else 0.0,
+                "priority_waiting": sum(1 for t in lane.waiters if t.priority > 0),
             } for lane in sorted(self._lanes.values(), key=lambda l: l.model)],
             "stats": dict(self.stats),
         }
@@ -178,27 +204,47 @@ class GpuScheduler:
     # ---- internals (synchronous; every state change dispatches) ----
 
     def _yielding(self, cur: _Lane, now: float) -> bool:
-        others_waiting = any(l.waiters for l in self._lanes.values() if l is not cur)
-        return others_waiting and now - self._turn_started >= self.switch_after_s
+        others = [l for l in self._lanes.values() if l is not cur and l.waiters]
+        if not others:
+            return False
+        if now - self._turn_started >= self.switch_after_s:
+            return True
+        if now == self._turn_started:
+            return False  # a turn that starts in this dispatch fills its free slots first
+        # A higher-priority request for another model does not wait for the turn to age.
+        mine = cur.best_priority() if cur.waiters else 0
+        return max(l.best_priority() for l in others) > mine
+
+    def _reserved(self, lane: _Lane) -> int:
+        # Lanes with a single slot (qwen35) cannot spare one: normal keys would never run there.
+        return self.reserved_slots if lane.capacity > self.reserved_slots else 0
+
+    def _grantable(self, lane: _Lane, ticket: Ticket) -> bool:
+        limit = lane.capacity if ticket.priority > 0 else lane.capacity - self._reserved(lane)
+        return lane.running < limit
+
+    def _normal_waiting(self) -> int:
+        return sum(1 for lane in self._lanes.values() for t in lane.waiters if t.priority <= 0)
 
     def _dispatch(self) -> None:
         now = self.clock()
         while self.active < self.global_limit:
             cur = self._turn
             others = [l for l in self._lanes.values() if l is not cur and l.waiters]
-            if cur is not None and cur.waiters and cur.running < cur.capacity and not self._yielding(cur, now):
+            if cur is not None and cur.waiters and self._grantable(cur, cur.next_waiter()) and not self._yielding(cur, now):
                 if cur.running == 0 and not others:
                     self._turn_started = now  # idle time does not count towards the turn
-                self._grant(cur.waiters[0], now)
+                self._grant(cur.next_waiter(), now)
             elif cur is not None and cur.running > 0:
                 return  # lane full or draining for a switch; the next release dispatches again
             elif others:
-                nxt = min(others, key=lambda l: l.waiters[0].enqueued_at)
+                # Priority waiters first, then the model that has waited longest.
+                nxt = min(others, key=lambda l: (-l.best_priority(), l.waiters[0].enqueued_at))
                 if cur is not None:
                     self.stats["switches"] += 1
                     log.info("gpu turn %s -> %s (%d waiting)", cur.model, nxt.model, self.waiting)
                 self._turn, self._turn_started = nxt, now
-                self._grant(nxt.waiters[0], now)  # grant before re-checking, so switch_after_s=0 cannot spin
+                self._grant(nxt.next_waiter(), now)  # grant before re-checking, so switch_after_s=0 cannot spin
             else:
                 return
 
@@ -207,6 +253,7 @@ class GpuScheduler:
         lane.waiters.remove(ticket)
         self.waiting -= 1
         lane.running += 1
+        lane.running_by_owner[ticket.owner] = lane.running_by_owner.get(ticket.owner, 0) + 1
         self.active += 1
         ticket.state = GRANTED
         ticket.dequeued_at = now
@@ -236,7 +283,13 @@ class GpuScheduler:
             self._leave_queue(ticket, CANCELLED)
         elif ticket.state == GRANTED:
             ticket.state = RELEASED
-            ticket.lane.running -= 1
+            lane = ticket.lane
+            lane.running -= 1
+            left = lane.running_by_owner[ticket.owner] - 1
+            if left:
+                lane.running_by_owner[ticket.owner] = left
+            else:
+                del lane.running_by_owner[ticket.owner]
             self.active -= 1
         else:
             return
