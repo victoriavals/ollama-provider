@@ -36,6 +36,7 @@
       <button type="button" class="nav" data-view="keys">API key</button>
       <button type="button" class="nav" data-view="usage">Pemakaian</button>
       <button type="button" class="nav" data-view="requests">Request</button>
+      <button type="button" class="nav" data-view="prompts">Prompt</button>
       <button type="button" class="nav" data-view="models">Model</button>
     </nav>
 
@@ -86,22 +87,28 @@
         <h2 id="h-keys">API key</h2>
         <section class="panel">
           <h3>Buat key baru</h3>
-          <form id="key-form" class="form-row">
-            <div class="field grow">
-              <label for="key-name">Nama client</label>
-              <input id="key-name" required maxlength="100" placeholder="mis. aplikasi-chat">
+          <form id="key-form" class="key-form">
+            <div class="form-row">
+              <div class="field grow">
+                <label for="key-name">Nama client</label>
+                <input id="key-name" required maxlength="100" placeholder="mis. aplikasi-chat">
+              </div>
+              <div class="field">
+                <label for="key-rpm">Batas / menit</label>
+                <input id="key-rpm" type="number" min="1" max="100000" inputmode="numeric">
+              </div>
+              <div class="field">
+                <label for="key-conc">Request paralel</label>
+                <input id="key-conc" type="number" min="1" max="64" inputmode="numeric">
+              </div>
+              <button type="submit" class="btn primary">Buat key</button>
             </div>
-            <div class="field">
-              <label for="key-rpm">Batas / menit</label>
-              <input id="key-rpm" type="number" min="1" max="100000" inputmode="numeric">
-            </div>
-            <div class="field">
-              <label for="key-conc">Request paralel</label>
-              <input id="key-conc" type="number" min="1" max="64" inputmode="numeric">
-            </div>
-            <button type="submit" class="btn primary">Buat key</button>
+            <p class="hint" id="key-defaults"></p>
+            <details class="advanced">
+              <summary>Batas lanjutan: kuota token, masa berlaku, model, prioritas</summary>
+              <div id="key-policy" class="policy"></div>
+            </details>
           </form>
-          <p class="hint" id="key-defaults"></p>
         </section>
         <section class="panel">
           <div class="panel-head">
@@ -111,9 +118,9 @@
           <div class="table-wrap">
             <table class="table" id="keys-table">
               <thead><tr>
-                <th scope="col">Nama</th><th scope="col">Prefix</th><th scope="col" class="num">Batas / menit</th>
-                <th scope="col" class="num">Paralel</th><th scope="col">Terakhir dipakai</th><th scope="col">Status</th>
-                <th scope="col"><span class="sr-only">Aksi</span></th>
+                <th scope="col">Nama</th><th scope="col">Prefix</th><th scope="col">Batas</th>
+                <th scope="col">Kuota token</th><th scope="col">Akses</th><th scope="col">Terakhir dipakai</th>
+                <th scope="col">Status</th><th scope="col"><span class="sr-only">Aksi</span></th>
               </tr></thead>
               <tbody></tbody>
             </table>
@@ -152,6 +159,62 @@
       </section>
 
       <!-- Request -->
+      <!-- Prompt -->
+      <section id="view-prompts" class="view" aria-labelledby="h-prompts" hidden>
+        <h2 id="h-prompts">Log prompt</h2>
+        <section class="panel">
+          <form id="prompt-filter" class="form-row">
+            <div class="field">
+              <label for="pf-range">Rentang</label>
+              <select id="pf-range">
+                <option value="1h">1 jam terakhir</option>
+                <option value="24h" selected>24 jam terakhir</option>
+                <option value="7d">7 hari terakhir</option>
+                <option value="30d">30 hari terakhir</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="pf-key">Key</label>
+              <select id="pf-key"><option value="">Semua key</option></select>
+            </div>
+            <div class="field">
+              <label for="pf-model">Model</label>
+              <select id="pf-model"><option value="">Semua model</option></select>
+            </div>
+            <div class="field">
+              <label for="pf-status">Status</label>
+              <select id="pf-status">
+                <option value="all">Semua</option>
+                <option value="ok">Berhasil</option>
+                <option value="error">Gagal / ditolak</option>
+              </select>
+            </div>
+            <div class="field grow">
+              <label for="pf-q">Cari teks (min. 3 huruf)</label>
+              <input id="pf-q" type="search" maxlength="200" placeholder="kata di prompt, jawaban, atau user">
+            </div>
+            <button type="submit" class="btn primary">Terapkan</button>
+          </form>
+          <p class="hint" id="prompt-note"></p>
+        </section>
+        <section class="panel">
+          <div class="table-wrap">
+            <table class="table" id="prompts-table">
+              <thead><tr>
+                <th scope="col">Waktu</th><th scope="col">Key</th><th scope="col">IP / user</th><th scope="col">Model</th>
+                <th scope="col">Status</th><th scope="col" class="num">Token</th><th scope="col">Prompt</th>
+                <th scope="col">Jawaban</th><th scope="col"><span class="sr-only">Aksi</span></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="load-more">
+            <button type="button" class="btn" id="prompts-more" hidden>Muat 50 lagi</button>
+            <span class="muted" id="prompts-count"></span>
+          </div>
+        </section>
+      </section>
+
       <section id="view-requests" class="view" aria-labelledby="h-requests" hidden>
         <h2 id="h-requests">Request terbaru</h2>
         <div class="filters">
