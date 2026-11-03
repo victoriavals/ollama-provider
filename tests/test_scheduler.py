@@ -22,9 +22,9 @@ class Clock:
         return self.t
 
 
-def make(global_limit=4, max_queue=32, switch_after_s=10.0) -> tuple[GpuScheduler, Clock]:
+def make(global_limit=4, max_queue=32, switch_after_s=10.0, reserved_slots=0) -> tuple[GpuScheduler, Clock]:
     clock = Clock()
-    return GpuScheduler(global_limit, max_queue, switch_after_s, clock=clock), clock
+    return GpuScheduler(global_limit, max_queue, switch_after_s, clock=clock, reserved_slots=reserved_slots), clock
 
 
 def states(tickets) -> list[str]:
@@ -128,6 +128,120 @@ async def test_close_releases_waiters_and_refuses_new_requests():
     assert (s.active, s.waiting) == (0, 0)
 
 
+async def test_key_with_fewer_running_requests_goes_first():
+    s, clock = make(global_limit=2)
+    flood = []
+    for _ in range(4):
+        flood.append(s.enqueue("m", None, 60, owner="A"))
+        clock.t += 1
+    b = s.enqueue("m", None, 60, owner="B")  # arrives after all of A's requests
+    assert states(flood) == ["granted", "granted", "waiting", "waiting"] and b.state == "waiting"
+    assert (s.position(b), s.position(flood[2])) == (1, 2)
+    flood[0].close()
+    assert b.state == "granted" and flood[2].state == "waiting"  # B had 0 running, A had 1
+    flood[1].close()
+    assert flood[2].state == "granted"  # A has none running now (B has 1): A's oldest goes next
+
+
+async def test_priority_key_goes_first_within_a_lane():
+    s, clock = make(global_limit=1)
+    running = s.enqueue("m", None, 60, owner="A")
+    normal = s.enqueue("m", None, 60, owner="B")
+    clock.t += 5
+    vip = s.enqueue("m", None, 60, owner="C", priority=1)
+    assert (s.position(vip), s.position(normal)) == (1, 2)
+    assert s.snapshot()["lanes"][0]["priority_waiting"] == 1
+    running.close()
+    assert vip.state == "granted" and normal.state == "waiting"
+
+
+async def test_priority_waiter_wins_the_model_handover():
+    s, clock = make(switch_after_s=0)
+    a = s.enqueue("a", None, 60)
+    older = s.enqueue("b", None, 60, owner="B")
+    clock.t += 3
+    vip = s.enqueue("c", None, 60, owner="C", priority=1)
+    a.close()
+    assert vip.state == "granted" and older.state == "waiting"
+
+
+async def test_reserved_slot_is_kept_for_priority_keys():
+    s, _ = make(reserved_slots=1)
+    normal = [s.enqueue("gemma", None, 60, owner="A") for _ in range(4)]
+    assert states(normal) == ["granted"] * 3 + ["waiting"]  # 4 slots, 1 kept free
+    vip = s.enqueue("gemma", None, 60, owner="O", priority=9)
+    assert vip.state == "granted" and s.active == 4
+    assert s.snapshot()["lanes"][0]["reserved"] == 1
+    single = [s.enqueue("qwen", 1, 60, owner="B"), s.enqueue("qwen", 1, 60, owner="C")]
+    for t in normal[:3] + [vip]:
+        t.close()
+    assert normal[3].state == "granted" and single[0].state == "waiting"
+    normal[3].close()
+    assert single[0].state == "granted"
+    single[0].close()
+    assert single[1].state == "granted"  # a 1-slot model keeps no reserve: normal keys still run there
+
+
+async def test_priority_request_is_never_rejected_for_a_full_queue():
+    s, _ = make(global_limit=1, max_queue=0)
+    s.enqueue("gemma", None, 60)
+    assert s.enqueue("gemma", None, 60) is None  # normal: queue full
+    vip = s.enqueue("gemma", None, 60, owner="O", priority=9)
+    assert vip is not None and vip.state == "waiting"
+
+
+async def test_priority_request_for_another_model_ends_the_turn_at_once():
+    s, clock = make(switch_after_s=10)
+    a1 = s.enqueue("gemma", None, 60, owner="A")
+    b = s.enqueue("qwen", 1, 60, owner="B")
+    clock.t += 1
+    a2 = s.enqueue("gemma", None, 60, owner="A")
+    assert a2.state == "granted"  # a normal waiter for qwen does not end a 1 s old turn
+    vip = s.enqueue("qwen", 1, 60, owner="O", priority=9)
+    a3 = s.enqueue("gemma", None, 60, owner="A")
+    assert a3.state == "waiting" and s.snapshot()["turn"]["yielding"]  # gemma drains now
+    a1.close()
+    a2.close()
+    assert vip.state == "granted" and b.state == "waiting"  # running requests finished, nothing preempted
+
+
+async def test_random_operations_keep_scheduler_invariants():
+    import random
+    for seed in range(60):
+        rnd = random.Random(seed)
+        s, clock = make(global_limit=rnd.choice([1, 2, 4]), max_queue=rnd.choice([0, 3, 32]),
+                        switch_after_s=rnd.choice([0, 0.5, 10]))
+        s.reserved_slots = rnd.choice([0, 0, 1, 2])
+        caps = {"a": 1, "b": rnd.choice([2, 4]), "c": None}
+        live = []
+        for _ in range(400):
+            op = rnd.random()
+            if op < 0.45:
+                m = rnd.choice(list(caps))
+                t = s.enqueue(m, caps[m], 60, owner=rnd.choice("XYZ"), priority=rnd.choice([0, 0, 0, 1]))
+                if t is not None:
+                    live.append(t)
+            elif op < 0.8 and live:
+                live.pop(rnd.randrange(len(live))).close()
+            elif op < 0.9 and live:
+                s._expire(rnd.choice(live))
+            else:
+                clock.t += rnd.choice([0.1, 1, 5, 20])
+            lanes = s._lanes.values()
+            assert s.active == sum(l.running for l in lanes) <= s.global_limit
+            assert s.waiting == sum(len(l.waiters) for l in lanes)
+            assert s._normal_waiting() <= s.max_queue  # priority requests are never rejected for a full queue
+            for l in lanes:  # normal requests never take a reserved slot
+                normal_running = sum(1 for t in live if t.lane is l and t.state == "granted" and t.priority == 0)
+                assert normal_running <= l.capacity - s._reserved(l)
+            assert all(l.running == sum(l.running_by_owner.values()) and l.running <= l.capacity for l in lanes)
+            assert sum(1 for l in lanes if l.running) <= 1  # one model on the GPU at a time
+            assert all((t.state == "waiting") != t._future.done() for t in live)
+        for t in live:
+            t.close()
+        assert (s.active, s.waiting) == (0, 0)
+
+
 async def test_expired_waiter_of_another_model_unblocks_the_turn_model():
     s, _ = make(switch_after_s=0)
     s.enqueue("a", None, 60)
@@ -197,7 +311,8 @@ async def test_queue_ms_and_snapshot():
     snap = s.snapshot()
     assert (snap["global_limit"], snap["active"], snap["waiting"]) == (4, 1, 1)
     assert snap["turn"] == {"model": "qwen", "age_s": 2.5, "yielding": False}
-    assert snap["lanes"] == [{"model": "qwen", "capacity": 1, "running": 1, "waiting": 1, "oldest_wait_s": 2.5}]
+    assert snap["lanes"] == [{"model": "qwen", "capacity": 1, "reserved": 0, "running": 1, "waiting": 1,
+                              "oldest_wait_s": 2.5, "priority_waiting": 0}]
     q1.close()
     clock.t += 3
     assert (q1.queue_ms, q2.queue_ms) == (0, 2500)
@@ -256,7 +371,7 @@ async def test_serial_model_reaches_ollama_one_request_at_a_time(public, gw, oll
     release, calls = hold_upstream(ollama)
     reqs = [asyncio.create_task(public.post("/v1/chat/completions", headers=auth, json=QWEN)) for _ in range(2)]
     await wait_until(lambda: len(calls) == 1 and gw.scheduler.waiting == 1)
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.15)  # > 0.05 s, so oldest_wait_s (1 decimal) cannot round to 0.0
     assert len(calls) == 1  # 2 global slots free, but qwen35 runs one at a time
     lane = gw.scheduler.snapshot()["lanes"][-1]
     assert (lane["model"], lane["capacity"], lane["running"], lane["waiting"]) == ("qwen3.5:4b", 1, 1, 1)
@@ -412,3 +527,16 @@ async def test_warmup_goes_through_the_scheduler(gw, ollama):
     assert route.call_count == 1
     for ticket in held:
         ticket.close()
+
+
+async def test_a_new_turn_fills_its_free_slots_before_yielding_to_a_priority_waiter():
+    s, clock = make(switch_after_s=10)
+    q = s.enqueue("qwen", 1, 60, owner="A")
+    g = [s.enqueue("gemma", None, 60, owner="B") for _ in range(3)]
+    vip = s.enqueue("qwen", 1, 60, owner="O", priority=9)
+    clock.t += 11  # the qwen turn is old: the waiting gemma requests get their turn next
+    q.close()
+    assert states(g) == ["granted"] * 3 and vip.state == "waiting"  # not one gemma request per swap
+    clock.t += 1
+    late = s.enqueue("gemma", None, 60, owner="B")
+    assert late.state == "waiting"  # now the priority waiter makes gemma drain
