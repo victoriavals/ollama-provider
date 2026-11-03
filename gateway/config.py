@@ -30,12 +30,18 @@ class Settings(BaseSettings):
     # Public base URL shown in the admin dashboard (e.g. https://xyz.ngrok-free.dev/v1). Kept in
     # .env only, so the domain never lands in the public repo.
     public_base_url: str = ""
+    # Client guide link put in the dashboard's "message for the client" (e.g. CLIENT.md on GitHub)
+    client_guide_url: str = ""
     # Host headers the admin app accepts (blocks DNS-rebinding pages from reaching port 8001)
     admin_allowed_hosts: str = "127.0.0.1,localhost"
 
     # Storage
     db_path: Path = BASE_DIR / "data" / "gateway.db"
     usage_retention_days: int = 90
+    # Prompt & response audit log (table prompt_logs, admin dashboard "Prompt"); a key can opt out
+    prompt_log_enabled: bool = True
+    prompt_log_retention_days: int = 30
+    prompt_log_max_chars: int = 20_000  # per prompt and per response; the rest is cut off
     # Comma-separated models added to the allowlist on first start
     seed_models: str = "gemma3:4b"
 
@@ -56,6 +62,10 @@ class Settings(BaseSettings):
     model_parallel: str = ""
     # Architectures (/api/show general.architecture) Ollama runs one request at a time
     serial_architectures: str = "qwen35"
+    # Keys with priority > 0: slots per model kept free for them (models with more slots than this),
+    # and how long their requests may wait (they are never rejected for a full queue)
+    priority_reserved_slots: int = 1
+    priority_queue_timeout_s: float = 300.0
     stream_ping_interval_s: float = 15.0
 
     # Thinking models: reasoning_effort applied when the client sends none ("" = model default).
@@ -101,7 +111,15 @@ class Settings(BaseSettings):
         _parse_model_parallel(v)
         return v
 
-    @field_validator("max_queue", "model_switch_after_s", "queue_timeout_s")
+    @field_validator("prompt_log_max_chars", "prompt_log_retention_days")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("must be >= 1")
+        return v
+
+    @field_validator("max_queue", "model_switch_after_s", "queue_timeout_s", "priority_reserved_slots",
+                     "priority_queue_timeout_s")
     @classmethod
     def _non_negative(cls, v: float) -> float:
         if not math.isfinite(v) or v < 0:  # pydantic accepts nan/inf for floats
