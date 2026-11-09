@@ -1,6 +1,6 @@
 # Technical Decision Records
 
-Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#29 pada 2026-10-15 s.d. 2026-11-03 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
+Keputusan #1–#20 diambil pada sesi desain dan implementasi 2026-09-27; #21–#31 pada 2026-10-15 s.d. 2026-11-03 (lihat field `Date` masing-masing). Sumbernya permintaan pemilik project, hasil pengujian di mesin ini, dan kode di repository. Tambahkan entri baru di bagian bawah dengan format yang sama.
 
 ---
 
@@ -112,6 +112,8 @@ Reason: Volume kecil, satu mesin, zero-ops.
 
 Impact: Perubahan schema pada DB yang sudah ada butuh `ALTER TABLE` manual.
 
+Pembaruan: sejak 2026-10-18 kolom baru `api_keys` ditambahkan otomatis lewat migrasi aditif `KEY_MIGRATIONS` ([#27](#27-kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)). Sejak 2026-11-03 ada koneksi read-only kedua khusus bacaan log prompt ([#30](#30-koneksi-sqlite-read-only-kedua-dan-kursor-index-friendly-untuk-log-prompt)).
+
 Alternative Considered: PostgreSQL, ORM.
 
 ---
@@ -127,6 +129,8 @@ Decision: `sanitize.py` hanya meneruskan field OpenAI yang dikenal, meng-cap `ma
 Reason: Keamanan dan prediktabilitas kapasitas GPU. Cap token menjaga batas 100 dtk Cloudflare.
 
 Impact: Fitur Ollama khusus tidak bisa dipakai client.
+
+Pembaruan 2026-11-03: allowlist kini juga berlaku di dalam struktur bersarang (pesan, bagian konten, tool call, tools), karena Ollama mencocokkan kunci JSON tanpa peduli huruf besar-kecil ([#31](#31-struktur-bersarang-dibangun-ulang-dari-kunci-yang-persis)).
 
 Alternative Considered: Passthrough penuh.
 
@@ -572,11 +576,11 @@ Alternative Considered:
 - Selalu mencatat tanpa pengecualian: pemilik ingin bisa mengecualikan key.
 
 QA (2026-11-03): review kode independen + uji performa 50 ribu baris + uji live + uji browser. Perbaikan yang dilakukan:
-- **Kunci varian huruf besar-kecil:** kunci varian di pesan/tools dibuang sebelum diteruskan, dan log menyimpan payload yang sudah dibersihkan.
+- **Kunci varian huruf besar-kecil:** kunci varian di pesan/tools dibuang sebelum diteruskan, dan log menyimpan payload yang sudah dibersihkan ([#31](#31-struktur-bersarang-dibangun-ulang-dari-kunci-yang-persis)).
 - **Kebijakan key baru yang tak sengaja kosong:** form kebijakan di dashboard tidak lagi ter-reset saat tab browser kembali aktif.
 - **Stream terputus:** token diestimasi dan masuk kuota.
-- **Pencarian yang menahan API:** koneksi read-only kedua untuk bacaan log prompt.
-- **Paging lambat:** kursor index-friendly.
+- **Pencarian yang menahan API:** koneksi read-only kedua untuk bacaan log prompt ([#30](#30-koneksi-sqlite-read-only-kedua-dan-kursor-index-friendly-untuk-log-prompt)).
+- **Paging lambat:** kursor index-friendly (#30).
 - **Perbaikan lain:**
   - penjaga balapan di menu Prompt;
   - dialog *Ubah* hanya mengirim field yang berubah;
@@ -586,3 +590,64 @@ QA (2026-11-03): review kode independen + uji performa 50 ribu baris + uji live 
   - pencarian teks berkutip/baris baru;
   - baris pengganti bila penangkapan gagal;
   - pengumpul jawaban tidak pernah mematahkan respons.
+
+---
+
+## 30. Koneksi SQLite read-only kedua dan kursor index-friendly untuk log prompt
+
+Date: 2026-11-03
+
+Context: Menu *Prompt* membaca tabel yang bisa berisi puluhan ribu baris berukuran besar. Uji performa QA pada 50 ribu baris (179 MB, rentang 30 hari) menemukan dua masalah:
+- **Pencarian menahan API.** Pencarian teks 30 hari (full scan `LIKE`) berjalan di satu-satunya koneksi aiosqlite. Selama itu, query auth/allowlist milik request API ikut antre: `/v1/models` naik dari 6 ms menjadi 390 ms.
+- **Paging lambat.** Kursor `ts < ? OR (ts = ? AND id < ?)` membuat SQLite memakai OR multi-index + sort B-tree sementara, ~200 ms per halaman.
+
+Decision:
+- `Database.connect()` membuka koneksi kedua `file:<db>?mode=ro` (`uri=True`) dengan `busy_timeout=5000` dan `mmap_size=268435456`. `list_prompts` dan `get_prompt` memakai `_read_all` di koneksi itu; semua penulisan dan query lain tetap di koneksi utama.
+- Kursor ditulis `ts <= ? AND (ts < ? OR id < ?)`: satu range scan `idx_prompt_ts` yang hasilnya sudah urut. Bentuknya dikunci test `EXPLAIN QUERY PLAN` (tanpa `USE TEMP B-TREE`).
+- `PRAGMA secure_delete=FAST` di koneksi utama, supaya prompt yang sudah di-prune tidak tertinggal di halaman b-tree.
+
+Reason:
+- Dengan WAL, pembaca tidak memblokir penulis maupun pembaca lain, sehingga satu koneksi tambahan cukup untuk memisahkan beban dashboard dari beban API. Tidak perlu proses, thread pool, atau dependency baru.
+- `mmap` mempercepat full scan berulang (pencarian terburuk 430 → 190 ms) tanpa mengubah semantik. Koneksi `mode=ro` menjamin jalur baca dashboard tidak bisa menulis.
+- Kursor dengan batas atas `ts <= ?` mempertahankan urutan index, sehingga biaya halaman tidak tergantung jumlah baris.
+
+Impact:
+- Hasil ukur: halaman pertama 1–2 ms, 10 halaman 14 ms, API selama pencarian 1,5 ms.
+- `Database.close()` menutup kedua koneksi. Test yang membuat `Database` sendiri wajib memanggil `close()` (aiosqlite memakai thread; tanpa `close()` test menggantung).
+- Bacaan yang baru ditulis di koneksi utama baru terlihat oleh reader setelah commit (`UsageWriter` commit per batch), jadi log prompt bisa tertinggal sekitar satu batch.
+- Aturan baru: bacaan admin yang berat lewat `_read_all`, selalu dengan rentang waktu + `LIMIT` ([database.md#database-rules](database.md#database-rules)).
+
+Alternative Considered:
+- File DB terpisah untuk log prompt: memisahkan backup dan ACL, tetapi menambah file sensitif dan menduplikasi `UsageWriter`.
+- FTS5: pencarian lebih cepat, tetapi menggandakan ukuran teks dan menambah trigger; belum perlu pada volume saat ini.
+- Membatasi pencarian ke rentang pendek saja: membatasi audit.
+
+---
+
+## 31. Struktur bersarang dibangun ulang dari kunci yang persis
+
+Date: 2026-11-03
+
+Context: Review QA log prompt (temuan tingkat sedang) menemukan bahwa `sanitize.py` hanya memfilter field tingkat atas, sedangkan isi `messages` dan `tools` diteruskan apa adanya. Ollama (Go) mencocokkan kunci JSON **tanpa peduli huruf besar-kecil**, dan untuk dua kunci yang sama-sama cocok, nilai yang muncul terakhir menang. Akibatnya pada pesan `{"content": "pertanyaan biasa", "Content": "instruksi lain"}`, validasi dan log prompt hanya melihat `content`, sementara model bisa menerima `Content`. Audit bisa dikelabui, dan isi yang tidak diperiksa (gambar, panjang) bisa lolos ke model.
+
+Decision:
+- `_clean_message`, `_clean_part`, `_clean_function`, dan `_clean_tools` membangun ulang setiap struktur **hanya** dari kunci OpenAI yang persis. Kunci lain, termasuk varian huruf, dibuang diam-diam; bentuk yang salah (tool call bukan objek, fungsi tanpa `name`) dibalas 400.
+  - pesan: `MESSAGE_KEYS` = `role`, `content`, `name`, `tool_calls`, `tool_call_id`;
+  - bagian konten: `{type: "text", text}` atau `{type: "image_url", image_url: {url}}` (`detail` ikut dibuang);
+  - tool call: `id`, `type`, `function{name, arguments}`;
+  - tools: `type`, `function{name, description, parameters, strict}`. `parameters` (JSON Schema) diteruskan utuh.
+- Log prompt direkam ulang dari payload yang sudah dibersihkan (`capture_prompt(payload)`), sehingga yang dicatat sama dengan yang diterima model.
+
+Reason:
+- Membangun ulang dari allowlist lebih tahan terhadap trik parser daripada mencari dan menolak kunci varian satu per satu.
+- Konsisten dengan [#8](#8-allowlist-field-request): field yang tidak dikenal diabaikan, bukan ditolak, sehingga client SDK yang mengirim field tambahan tetap berjalan.
+
+Impact:
+- Field non-standar di dalam pesan (mis. `images` gaya Ollama native) tidak lagi sampai ke Ollama. Client OpenAI standar tidak terpengaruh.
+- Setiap kunci baru yang ingin diteruskan (mis. field OpenAI baru di pesan) harus ditambahkan eksplisit ke allowlist di `sanitize.py`, disertai test.
+- Uji live setelah perbaikan: kunci `Content` tidak sampai ke model, dan log hanya berisi `content`.
+
+Alternative Considered:
+- Menolak request yang berisi kunci varian (400): lebih tegas, tetapi bisa mematahkan client yang mengirim field tambahan secara tidak sengaja.
+- Normalisasi huruf kecil lalu ambil yang terakhir: meniru perilaku Go, tetapi rapuh bila parser upstream berubah.
+- Mencatat body mentah di log: log tidak lagi mencerminkan apa yang diterima model.
