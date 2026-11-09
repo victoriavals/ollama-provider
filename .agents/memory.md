@@ -1,7 +1,7 @@
 # Project Memory: ollama-provider
 
 > **Baca file ini sebelum mengubah apa pun.** Ini ringkasan tertinggi. Detail ada di file lain di `.agents/` (lihat [Dokumentasi lain](#dokumentasi-lain)).
-> Terakhir diperbarui: 2026-10-18. Semua isi berasal dari kode di repository, kecuali bagian yang ditandai *(observasi mesin)*. Kondisi mesin, prosedur operasional, dan konteks pemilik ada di [operations.md](operations.md).
+> Terakhir diperbarui: 2026-11-03. Semua isi berasal dari kode di repository, kecuali bagian yang ditandai *(observasi mesin)*. Kondisi mesin, prosedur operasional, dan konteks pemilik ada di [operations.md](operations.md).
 > **Repo ini publik di GitHub:** jangan menulis rahasia, domain ngrok, IP, atau token di `.agents/`.
 
 ## Ringkasan project
@@ -35,7 +35,7 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 - Port 8001 dan 11434 **tidak pernah** diekspos lewat tunnel.
 - Detail lengkap: [architecture.md](architecture.md).
 
-## Status deployment *(observasi mesin, 2026-10-18)*
+## Status deployment *(observasi mesin, 2026-11-03)*
 
 | Komponen | Status |
 |---|---|
@@ -46,8 +46,11 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
 | Model | `gemma3:4b` (utama, dimuat saat start) + `qwen3.5:4b` (tools/JSON, sejak 2026-10-17). Masing-masing 100% GPU; hanya satu dimuat sekaligus (`OLLAMA_MAX_LOADED_MODELS=1`). `qwen3.5:9b` diuji lalu dihapus (87% GPU, 41 tok/dtk) |
 | Git | Branch `main`, remote publik `github.com/victoriavals/ollama-provider`. Agent Codex juga bekerja di repo ini: cek `.git/*.lock` dan proses `codex` sebelum operasi git |
 | Tray app Ollama (milik user Windows "User") | Autostart dimatikan (`Ollama.lnk` → `Ollama.lnk.disabled`), tidak di-uninstall |
-| API key client | 1 key aktif: `naufalnaufal` (id 7, milik pemilik, dipakai dari luar lewat ngrok). Sejak 2026-10-18 atas permintaan pemilik: 100.000 request/menit, 64 paralel, tanpa kuota/masa berlaku/batasan model, **prioritas 9**. Key lain adalah key uji yang sudah dicabut |
-| Reboot | Teruji 2026-10-17: Windows Update me-restart PC, semua service pulih otomatis tanpa login |
+| API key client | 1 key aktif: `naufalnaufal` (id 7, milik pemilik, dipakai dari luar lewat ngrok). Sejak 2026-10-18 atas permintaan pemilik: 100.000 request/menit, 64 paralel, tanpa kuota/masa berlaku/batasan model, **prioritas 9**, `log_prompts=1` (prompt pemilik ikut tercatat). Key lain (40) adalah key uji yang sudah dicabut |
+| Setting produksi di luar default | `.env`: `QUEUE_TIMEOUT_S=60` (eksplisit), `WATCH_SERVICES=OllamaServe,NgrokTunnel`, `PUBLIC_BASE_URL` (rahasia, tidak ditulis di sini), `CLIENT_GUIDE_URL` (tautan `CLIENT.md` di GitHub). Daftar lengkap: [architecture.md#konfigurasi](architecture.md#konfigurasi-gatewayconfigpy) |
+| Log prompt (`prompt_logs`) | Aktif sejak 2026-11-03. Isinya 251 baris, **semuanya dari key uji QA** yang sudah dicabut (`qa-soak`, `qa-plog-edge`, `qa-plog-on`, `qa-fix-live`). Pemilik belum memutuskan apakah baris ini dihapus; tanpa tindakan, baris terhapus otomatis setelah 30 hari (~2026-12-03) |
+| Backup DB | Manual saja: `data/backups/gateway-20261018-133759.db` (sebelum migrasi #27) dan `gateway-20261103-081048.db` (sebelum migrasi #29). Backup ikut memuat `prompt_logs` dan tidak dipangkas otomatis |
+| Reboot | Teruji 2026-10-17: Windows Update me-restart PC, semua service pulih otomatis tanpa login. Boot terakhir 2026-10-17 23:09 |
 
 ## Pengetahuan kritis (jebakan yang pernah terjadi)
 
@@ -95,11 +98,12 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
     - **Dashboard:** `/admin/prompts` selalu dibatasi rentang waktu (default 24 jam), `LIMIT` ≤ 100, kursor `ts|id`, dan hanya mengembalikan cuplikan; isi lengkap lewat `/admin/prompts/{id}`. Pencarian `q` (≥ 3 huruf) memakai `LIKE` dengan escape `%`/`_`. Jangan menambah auto-refresh di menu Prompt.
     - `prompt_logs.ts` = waktu request **selesai**, sehingga urut dengan `id`. `CLIENT.md#privasi` memberi tahu client.
     - **QA 2026-11-03** (review independen + uji live):
-      - `sanitize_chat` kini membangun ulang pesan, bagian konten, tool call, dan tools hanya dari kunci OpenAI yang persis. Ollama (Go) membaca kunci JSON tanpa peduli huruf besar-kecil, sehingga `"Content"` bisa lolos ke model tanpa diperiksa atau dicatat.
+      - `sanitize_chat` kini membangun ulang pesan, bagian konten, tool call, dan tools hanya dari kunci OpenAI yang persis ([decisions.md #31](decisions.md#31-struktur-bersarang-dibangun-ulang-dari-kunci-yang-persis)). Ollama (Go) membaca kunci JSON tanpa peduli huruf besar-kecil, sehingga `"Content"` bisa lolos ke model tanpa diperiksa atau dicatat. Kunci baru yang perlu diteruskan harus ditambahkan eksplisit ke allowlist.
       - Log disimpan dari payload yang sudah dibersihkan.
-      - Bacaan log prompt memakai **koneksi read-only kedua** (`Database._reader`, `mmap`), supaya pencarian berat tidak menahan query auth/allowlist milik request API (sebelumnya `/v1/models` 6 → 390 ms selama pencarian).
+      - Bacaan log prompt memakai **koneksi read-only kedua** (`Database._reader`, `mmap`, [decisions.md #30](decisions.md#30-koneksi-sqlite-read-only-kedua-dan-kursor-index-friendly-untuk-log-prompt)), supaya pencarian berat tidak menahan query auth/allowlist milik request API (sebelumnya `/v1/models` 6 → 390 ms selama pencarian).
       - Kursor halaman ditulis `ts <= ? AND (ts < ? OR id < ?)`, karena bentuk `OR` biasa memicu sort tabel sementara (200 ms per halaman pada 50 ribu baris).
       - Stream yang terputus sebelum chunk usage kini diestimasi (token per chunk + perkiraan prompt) dan masuk kuota.
+    - **Data sensitif:** `prompt_logs` dan file di `data/backups/` berisi prompt client. Jangan menyalin isinya ke chat, commit, atau script; hapus baris (di luar prune) hanya dengan persetujuan pemilik. Rincian kolom dan ukuran: [database.md](database.md#prompt_logs). Runbook: [operations.md](operations.md#runbook).
 
 ## Aturan wajib untuk AI Agent
 
@@ -136,7 +140,8 @@ Aturan operasional tambahan:
 | `gateway/middleware.py` | Request id + access log JSON | Pure ASGI |
 | `gateway/health.py` | Health monitor dependency | |
 | `gateway/logs.py` | Log file harian | Tanpa rename (aman di-tail di Windows) |
-| `gateway/db.py` | Schema, query, `UsageWriter` | Satu-satunya tempat SQL |
+| `gateway/db.py` | Schema, migrasi aditif, query, `UsageWriter` (usage + log prompt), koneksi read-only `_reader` | Satu-satunya tempat SQL |
+| `tests/conftest.py` | Fixture test (`gw`, `public`, `admin`, `new_key`, `hold_slots`, `scheduler_idle`, `flush_usage`), mock Ollama | Test default memakai `priority_reserved_slots=0` |
 | `gateway/config.py` | Semua setting (env / `.env`) | |
 | `gateway/static/dashboard/` | Dashboard admin (`index.html`, `app.css`, `app.js`) | Tanpa `innerHTML`/CDN; CSP ketat dari `apps/admin.py` |
 | `scripts/common.ps1` | Helper deploy (WinSW, `Stop-ServiceSafe`, `Remove-OrphanOllamaRunners`, `Protect-AdminOnlyTree`, download) | Dipakai semua script |
@@ -145,7 +150,7 @@ Aturan operasional tambahan:
 | `scripts/status.ps1` | Ringkasan operasional satu layar | Tidak butuh admin |
 | `D:\ollama\ngrok\ngrok.yml` | Config ngrok berisi authtoken + domain (di luar repo) | **Sensitif**, ber-ACL protected |
 | `.env` | Secret (`ADMIN_KEY`) + konfigurasi | **Sensitif**, gitignored, ber-ACL |
-| `data/gateway.db` | Hash API key + usage | **Sensitif**, gitignored |
+| `data/gateway.db` | Hash API key, usage, **isi prompt & jawaban** (`prompt_logs`) | **Sensitif**, gitignored, ber-ACL. Begitu pula `data/backups/` |
 | `D:\ollama\services\*.xml` | Definisi service WinSW (dibuat script, di luar repo) | Jangan diedit manual; jalankan ulang script install |
 
 ## Pedoman pengembangan
@@ -161,11 +166,11 @@ Aturan operasional tambahan:
 
 | File | Isi |
 |---|---|
-| [architecture.md](architecture.md) | Alur request, komponen, API, integrasi eksternal, aturan arsitektur |
-| [database.md](database.md) | Schema SQLite, tabel, index, strategi migrasi, aturan DB |
-| [conventions.md](conventions.md) | Penamaan, struktur, error handling, keamanan, performa, test, PowerShell |
-| [decisions.md](decisions.md) | Technical Decision Records |
-| [commands.md](commands.md) | Perintah install, dev, test, DB, deploy, debugging |
+| [architecture.md](architecture.md) | Alur request, komponen, API, field access log, **referensi semua setting**, integrasi eksternal, aturan arsitektur |
+| [database.md](database.md) | Schema SQLite (semua kolom), index, dua koneksi, alur data, ukuran & pertumbuhan, strategi migrasi, aturan DB, isi saat ini |
+| [conventions.md](conventions.md) | Penamaan, struktur, error handling, keamanan, performa, test (fixture, jam palsu, mutasi), dashboard, PowerShell |
+| [decisions.md](decisions.md) | Technical Decision Records #1–#31 |
+| [commands.md](commands.md) | Perintah install, dev, test, lint, DB, admin API (kebijakan key, log prompt), deploy, QA & uji performa, debugging |
 | [features.md](features.md) | Daftar fitur beserta status dan lokasi |
 | [operations.md](operations.md) | Kondisi mesin & VRAM, akses jarak jauh, runbook operasional, insiden, konteks & preferensi pemilik, pekerjaan tertunda, riwayat perubahan |
 | `../README.md` | Panduan pengguna/operator (Indonesia) |
