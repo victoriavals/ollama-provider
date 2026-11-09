@@ -42,13 +42,15 @@ data/  logs/        runtime, gitignored, jangan di-commit
 ## Function/class rules (Python)
 
 - Python 3.11: pakai `X | None`, `list[str]`, `dict[str, Any]`, dan type hint di semua signature publik.
-- `@dataclass` untuk struktur data sederhana (`ApiKey` frozen, `UsageRecord`, `RequestContext`, `RateResult` frozen).
+- `@dataclass` untuk struktur data sederhana (`ApiKey`, `RateResult`, `ModelInfo`, `QuotaStatus` frozen; `UsageRecord`, `PromptRecord`, `RequestContext` mutable karena dilengkapi `Finalizer`).
 - Seluruh I/O async. Blocking (subprocess, ctypes, `shutil.disk_usage`) → `asyncio.to_thread`.
 - Background task → `gw.spawn(coro, name)` (bukan `asyncio.create_task` langsung), supaya dibatalkan saat stop.
 - Akses state di route: `request.app.state.gw` (lihat `_gw()` di admin). Akses setting: `gw.settings`, bukan `get_settings()` di dalam route.
 - Hindari import sirkular: gunakan `TYPE_CHECKING` untuk type `Gateway` di modul level bawah (`proxy.py`, `health.py`).
 - Docstring modul singkat menjelaskan tanggung jawab dan *mengapa*. Komentar hanya untuk hal yang tidak jelas dari kode. Semua komentar dalam Bahasa Inggris.
 - Validasi body admin memakai model Pydantic (`Field(min_length=..., ge=...)`). Validasi body publik manual di `sanitize.py`, karena harus menerima struktur OpenAI yang longgar dan membuang field tak dikenal.
+- State in-memory yang dibagi antar request (`GpuScheduler`, `QuotaTracker`, `ConcurrencyGate`, `SlidingWindow`) hanya diubah di method sinkron, tanpa `await` di tengah perubahan. Dari thread lain (handler sinyal) pakai `loop.call_soon_threadsafe`.
+- Kode audit/observasi (log prompt, pengumpul jawaban) tidak boleh mematahkan request: bungkus dengan `try/except Exception`, catat lewat `log.exception`/`log.debug`, lalu lanjutkan.
 
 ## Error handling
 
@@ -72,10 +74,12 @@ data/  logs/        runtime, gitignored, jangan di-commit
 7. Pertahankan **allowlist** di `sanitize.py`. Field Ollama (`options`, `keep_alive`, `num_ctx`, `think`) harus tetap dibuang. `max_tokens` di-cap. `n>1` ditolak. `tools` hanya lolos kalau model punya capability `tools`. `image_url` hanya boleh `data:image/...;base64,...`; URL `http(s)`/`file` ditolak (cegah SSRF). `reasoning_effort` hanya untuk model ber-capability `thinking` (nilai `none`/`medium`/`high`), default dari `DEFAULT_REASONING_EFFORT`.
 8. Batas: body ≤ `MAX_BODY_BYTES` (dihitung saat stream masuk), gambar ≤ `MAX_IMAGES`, pesan ≤ `MAX_MESSAGES`, input embedding ≤ `MAX_EMBEDDING_INPUTS`, stop ≤ 4 × 100 karakter.
 9. Struktur bersarang yang diteruskan ke Ollama (pesan, bagian konten, tool call, tools) dibangun ulang dari kunci yang persis diizinkan (`sanitize._clean_message`, `_clean_tools`). Ollama (Go) mencocokkan kunci tanpa peduli huruf besar-kecil, jadi kunci varian seperti `Content` tidak boleh ikut diteruskan.
-9. Brute force: `FailedAuthLimiter` (20 gagal/menit per IP → 429). Docs OpenAPI publik dimatikan.
-10. File sensitif `.env` dan `data/` di-ACL (SID SYSTEM `S-1-5-18`, Administrators `S-1-5-32-544`, user installer). Di `icacls`, pakai SID, bukan nama (`WORKGROUP\user` gagal untuk akun lokal).
-11. Kode yang dijalankan SYSTEM (`D:\ollama`: binary Ollama/ngrok, XML & exe WinSW) tidak boleh writable oleh non-admin; jalankan `Protect-AdminOnlyTree` setelah menambah file di sana. Service yang menjalankan kode dari folder yang bisa diedit (gateway) memakai akun hak rendah (`-ServiceAccount 'NT AUTHORITY\LocalService'`).
-12. ngrok: `agent.web_addr: false` (inspector lokal 4040 merekam header Authorization & prompt). `ngrok.yml` berisi authtoken, ber-ACL protected.
+10. Brute force: `FailedAuthLimiter` (20 gagal/menit per IP → 429). Docs OpenAPI publik dimatikan.
+11. File sensitif `.env` dan `data/` di-ACL (SID SYSTEM `S-1-5-18`, Administrators `S-1-5-32-544`, user installer). Di `icacls`, pakai SID, bukan nama (`WORKGROUP\user` gagal untuk akun lokal).
+12. Kode yang dijalankan SYSTEM (`D:\ollama`: binary Ollama/ngrok, XML & exe WinSW) tidak boleh writable oleh non-admin; jalankan `Protect-AdminOnlyTree` setelah menambah file di sana. Service yang menjalankan kode dari folder yang bisa diedit (gateway) memakai akun hak rendah (`-ServiceAccount 'NT AUTHORITY\LocalService'`).
+13. ngrok: `agent.web_addr: false` (inspector lokal 4040 merekam header Authorization & prompt). `ngrok.yml` berisi authtoken, ber-ACL protected.
+14. Isi `prompt_logs` adalah data pribadi client. Agent tidak menyalinnya ke chat, commit, file di luar `data/`, atau script uji; untuk statistik cukup hitung baris. Fitur yang menyimpan isi request baru harus memakai aturan privasi `promptlog.py` (potong, gambar → ukuran, `mask_secrets`, opt-out per key, retensi) dan diumumkan di `CLIENT.md#privasi`.
+15. Key kedaluwarsa, model terlarang, dan model tak dikenal dijawab persis seperti OpenAI (401 `api_key_expired`, 404 `model_not_found` dengan pesan yang sama), supaya keberadaan model lain tidak bocor.
 
 ## Performance rules
 
@@ -87,22 +91,34 @@ data/  logs/        runtime, gitignored, jangan di-commit
 6. Usage ditulis batch di background. Access log ditulis sekali per request, setelah response selesai.
 7. Warm-up menjalankan inferensi 1 token (bukan hanya load), supaya request pertama tidak lambat.
 8. Request non-stream harus selesai < 100 dtk (Cloudflare 524); jaga dengan `MAX_TOKENS_CAP`.
+9. Query admin yang bisa berat (log prompt) memakai koneksi read-only (`Database._read_all`), selalu dengan rentang waktu + `LIMIT`, dan daftar hanya mengembalikan cuplikan. Kursor halaman memakai bentuk index-friendly `ts <= ? AND (ts < ? OR id < ?)`. Cek SQL baru dengan `EXPLAIN QUERY PLAN`.
+10. Jangan menambah query DB per request di jalur generasi bila datanya bisa dihitung di memori (contoh: kuota diisi sekali per key per periode, lalu ditambah `Finalizer`).
 
 ## Logging rules
 
 - Event aplikasi → logger `gateway.<area>` → `gateway-*.log`.
 - Aksi admin/CLI yang mengubah state wajib dicatat di audit log (`audit.info(...)` di `admin.py` / `cli.py`).
-- Data per request → tambahkan field ke `request.state.access` (dict), jangan menulis log per request sendiri.
+- Data per request → tambahkan field ke `request.state.access` (dict), jangan menulis log per request sendiri. Nama field access log adalah kontrak ([architecture.md#access-log](architecture.md#access-log-logsaccess-yyyy-mm-ddlog)): tambah boleh, ganti nama jangan.
 - Kesehatan dependency → komponen baru ditambahkan di `HealthMonitor._evaluate()` dengan status `ok`/`warn`/`down`/`absent`.
 - File log tidak pernah di-rename (`DailyFileHandler`), karena rename gagal di Windows saat file sedang di-tail.
 
 ## Testing rules
 
-- `uv run pytest` harus hijau (saat ini 155 test). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
+- `uv run pytest` harus hijau (saat ini 155 test, ~6 dtk). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
 - Ollama selalu di-mock: fixture `ollama` (respx `MockRouter`) dipasang ke `Gateway(..., ollama_transport=httpx.MockTransport(router.async_handler))`.
-- Gunakan fixture: `gw`, `public`, `admin`, `api_key`, `auth`, helper `new_key()` dan `flush_usage()` (`tests/conftest.py`).
+- Gunakan fixture: `gw`, `public`, `admin`, `api_key`, `auth`, dan helper di `tests/conftest.py`:
+  - `new_key(gw, name, **limits)`: key dengan kebijakan apa pun (`daily_token_limit`, `allowed_models`, `priority`, `log_prompts`, ...);
+  - `hold_slots(gw, model, n)`: mengisi slot GPU sebuah model (ticket dilepas dengan `close()`);
+  - `scheduler_idle(gw)`: cek tidak ada request berjalan/antre setelah test;
+  - `flush_usage(gw)`: menunggu `UsageWriter` menulis lalu mengembalikan baris `usage_logs`.
+- Mock Ollama `/api/show` memakai tabel `CAPS` (capability) dan `ARCH` (`general.architecture`, `qwen3.5:4b` = `qwen35`). Model baru di test harus ditambahkan ke keduanya.
+- `make_settings()` memakai `priority_reserved_slots=0`; test yang menguji slot cadangan men-set nilainya sendiri. Tanpa itu, `hold_slots()` tidak bisa mengisi slot cadangan.
 - Setting test via `make_settings()`: `health_interval_s=0`, `watch_services=""`, `log_dir=tmp_path/"logs"`, `warmup=False`. Test tidak boleh menyentuh service, GPU, atau jaringan sungguhan (kecuali `test_service_states_on_windows`, yang di-skip di non-Windows).
 - Respons Ollama baru → simpan respons asli di `tests/fixtures/`.
+- Waktu: `GpuScheduler(..., clock=)` dan `QuotaTracker(db, now=)` menerima jam palsu (contoh: `test_quota_periods_roll_over_in_local_time`); jangan `sleep` panjang untuk menguji giliran atau pergantian hari. Untuk nilai yang dibulatkan (mis. `oldest_wait_s`), beri jeda cukup (≥ 0,15 dtk) agar tidak flaky.
+- Test yang membuat `Database` sendiri wajib `await db.close()` di `finally` (dua koneksi aiosqlite; tanpa itu proses test menggantung).
+- Setiap perbaikan bug diberi test regresi, lalu diuji mutasi: kembalikan perbaikan sementara dan pastikan test itu gagal.
+- Query daftar baru: tambahkan test `EXPLAIN QUERY PLAN` seperti `test_prompt_list_queries_stay_on_the_ts_index`.
 - Periksa access log lewat `caplog` pada logger `gateway.access`.
 
 ## Dashboard rules (`gateway/static/dashboard/`)
@@ -113,7 +129,12 @@ data/  logs/        runtime, gitignored, jangan di-commit
 - Copy UI dalam Bahasa Indonesia, sentence case; tombol menyebut aksinya ("Buat key", "Cabut key").
 - Semua panggilan lewat `api()` (Bearer admin key dari `sessionStorage`); 401 → kembali ke layar login. Data baru dari backend ditambahkan ke admin API, bukan diambil langsung dari Ollama.
 - File baru harus didaftarkan di `UI_FILES` (`apps/admin.py`); route aset memakai whitelist.
-- Setelah mengubah tampilan: `node --check gateway/static/dashboard/app.js`, lalu screenshot desktop/ponsel (Edge headless via Playwright `channel="msedge"`) dan pastikan tidak ada overflow maupun error console.
+- `app.js` adalah ES module: fungsi tidak tersedia di `window`. Uji UI lewat interaksi DOM (klik, isi form), bukan memanggil fungsi langsung.
+- Menu yang datanya bisa besar (contoh: *Prompt*) tidak ikut auto-refresh maupun `visibilitychange`, wajib punya filter rentang waktu, memuat per halaman (`next`), membatasi jumlah baris di layar, dan mengambil detail hanya saat diminta.
+- Setiap pemuatan async yang bisa tumpang tindih memakai penjaga urutan (`seq`): jawaban lama dibuang bila sudah ada permintaan baru. Tombol dinonaktifkan selama memuat.
+- Form yang sedang diisi tidak boleh di-reset oleh polling atau `visibilitychange`. Dialog ubah hanya mengirim field yang berubah (PATCH parsial).
+- Tabel lebar dibungkus `.table-wrap` (`overflow-x: auto; position: relative`); kolom dialog `minmax(0, 1fr)` dan teks panjang memakai `pre.code.wrap`, supaya halaman ponsel tidak bisa digeser ke samping.
+- Setelah mengubah tampilan: `node --check gateway/static/dashboard/app.js`, lalu screenshot desktop 1366 px / ponsel 390 px / mode gelap (Edge headless via Playwright `channel="msedge"` atau CDP langsung), dan pastikan `scrollWidth` tidak melebihi lebar layar serta tidak ada error console.
 
 ## PowerShell script rules
 
