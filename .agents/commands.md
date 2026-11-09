@@ -61,16 +61,31 @@ curl.exe http://127.0.0.1:18000/v1/chat/completions -H "Authorization: Bearer sk
 ## Testing
 
 ```powershell
-uv run pytest                                    # semua test (79), Ollama di-mock, tanpa jaringan
+uv run pytest                                    # semua test (155), Ollama di-mock, tanpa jaringan, ~6 dtk
 uv run pytest tests/test_proxy.py -q             # satu file
 uv run pytest -k stream -q                       # filter nama test
+uv run pytest tests/test_scheduler.py tests/test_key_policy.py tests/test_prompt_log.py -q   # antrean, kebijakan key, log prompt
+node --check gateway/static/dashboard/app.js     # syntax dashboard (Node 20 terpasang di mesin ini)
 ```
 
-Lint (belum ada konfigurasi di repo; ini perintah ad-hoc yang dipakai saat pengembangan):
+| File test | Cakupan |
+|---|---|
+| `test_proxy.py` | Forward JSON/SSE, chunk usage, completions/embeddings, 404/413/400/429/503, error upstream, disconnect 499, fixture Ollama 0.40 |
+| `test_scheduler.py` | `GpuScheduler`: kapasitas, giliran, batas tunggu, antrean penuh, adil per key, prioritas + slot cadangan, shutdown, uji invarian acak deterministik |
+| `test_key_policy.py` | Migrasi kolom `api_keys`, kuota (termasuk pergantian periode dengan jam palsu), masa berlaku, model per key, admin/CLI |
+| `test_prompt_log.py` | Penangkapan, privasi, penolakan, stream, opt-out, query plan kursor, koneksi reader, prune, regresi QA |
+| `test_sanitize.py` | Allowlist field, gambar, tools, `reasoning_effort`, kunci persis |
+| `test_admin.py` | Admin API, dashboard (header ketat, tanpa `innerHTML`), Host header asing |
+| `test_auth.py`, `test_limits.py` | Auth, gagal-auth per IP, `X-Forwarded-For`, route tak dikenal, limiter |
+| `test_logging.py` | Access log, file log harian, transisi health, re-warm, disk, service Windows |
+
+Lint (belum ada konfigurasi di repo; perintah ad-hoc):
 
 ```powershell
-uv run --no-project --with ruff ruff check gateway tests --select E,F,W,B,SIM,I --ignore E501,SIM105,B008 --target-version py311
+uv run --no-project --with ruff ruff check gateway tests --select F,E9,B --ignore B008 --target-version py311
 ```
+
+Baseline 2026-11-03: satu temuan, `B017` di `tests/test_prompt_log.py` (`pytest.raises(Exception)` untuk penulisan ke koneksi read-only), tidak berdampak. `B008` diabaikan karena `Depends(...)` di argumen default adalah pola FastAPI. Aturan gaya yang lebih luas (`E,W,SIM,I`) belum bersih (nama variabel `l`, titik koma, urutan import) dan tidak dijadikan syarat.
 
 Validasi script PowerShell (syntax + ASCII-only):
 
@@ -86,6 +101,7 @@ CLI (langsung ke `data/gateway.db`, tanpa admin key; perubahan key berlaku di se
 .venv\Scripts\python.exe -m gateway.cli create-key --name client-a [--rpm 60] [--max-concurrent 2]
 .venv\Scripts\python.exe -m gateway.cli create-key --name teman-a --daily-tokens 100000 --monthly-tokens 2000000 --expires 2026-12-31 --models gemma3:4b --priority 0
 .venv\Scripts\python.exe -m gateway.cli create-key --name pribadi --no-prompt-log   # prompt key ini tidak dicatat
+#   --expires: tanggal (hari terakhir berlaku, WIB) atau datetime ISO; --models dipisah koma; --priority 0-9
 # CLI membuka DB langsung dan ikut menjalankan migrasi kolom baru: backup dulu setelah upgrade kode
 .venv\Scripts\python.exe -m gateway.cli list-keys
 .venv\Scripts\python.exe -m gateway.cli revoke-key <id>
@@ -104,14 +120,37 @@ Invoke-RestMethod http://127.0.0.1:8001/admin/keys -Headers $h
 Invoke-RestMethod -Method Post http://127.0.0.1:8001/admin/keys -Headers $h -ContentType 'application/json' -Body '{"name":"client-a","rpm_limit":60}'
 Invoke-RestMethod -Method Delete http://127.0.0.1:8001/admin/keys/3 -Headers $h
 Invoke-RestMethod "http://127.0.0.1:8001/admin/usage?group_by=key&since=2026-09-01" -Headers $h
-Invoke-RestMethod -Method Post http://127.0.0.1:8001/admin/backup -Headers $h      # -> data\backups\
+Invoke-RestMethod -Method Post http://127.0.0.1:8001/admin/backup -Headers $h      # -> data\backups\ (ikut berisi prompt_logs)
+
+# Kebijakan per key (PATCH hanya mengubah field yang dikirim; null = kembali ke default/tanpa batas)
+Invoke-RestMethod -Method Patch http://127.0.0.1:8001/admin/keys/3 -Headers $h -ContentType 'application/json' -Body '{"daily_token_limit":100000,"monthly_token_limit":2000000,"expires_at":"2026-12-31","allowed_models":["gemma3:4b"]}'
+Invoke-RestMethod -Method Patch http://127.0.0.1:8001/admin/keys/3 -Headers $h -ContentType 'application/json' -Body '{"priority":1}'
+Invoke-RestMethod -Method Patch http://127.0.0.1:8001/admin/keys/3 -Headers $h -ContentType 'application/json' -Body '{"log_prompts":false}'
+(Invoke-RestMethod http://127.0.0.1:8001/admin/keys -Headers $h).data | ft id, name, priority, log_prompts, expired, @{n='today';e={$_.usage.day_tokens}}
+
+# Log prompt (selalu terbatas rentang; default 24 jam, maks 100 baris per panggilan)
+(Invoke-RestMethod "http://127.0.0.1:8001/admin/prompts?limit=20" -Headers $h).data | ft id, ts, key_name, client_ip, end_user, model, status_code, prompt_preview
+Invoke-RestMethod "http://127.0.0.1:8001/admin/prompts?since=2026-11-01&key_id=7&status=error&q=password" -Headers $h
+Invoke-RestMethod "http://127.0.0.1:8001/admin/prompts?before=<nilai next dari halaman sebelumnya>" -Headers $h
+Invoke-RestMethod http://127.0.0.1:8001/admin/prompts/123 -Headers $h | ConvertTo-Json -Depth 5   # isi lengkap satu baris
+
+# Antrean GPU live
+(Invoke-RestMethod http://127.0.0.1:8001/admin/status -Headers $h).gateway.concurrency | ConvertTo-Json -Depth 5
 ```
+
+`$h` memuat `ADMIN_KEY` dari `.env` ke variabel sesi saja. Jangan mencetaknya, dan jangan menempelnya ke chat atau log. Script uji di scratchpad menerimanya lewat env var.
 
 Query read-only langsung:
 
 ```powershell
 .venv\Scripts\python.exe -c "import sqlite3; c=sqlite3.connect('file:data/gateway.db?mode=ro', uri=True); print(c.execute('select * from usage_logs order by id desc limit 5').fetchall())"
+# jumlah log prompt per key + rentang waktu (tanpa membaca isi prompt)
+.venv\Scripts\python.exe -c "import sqlite3; c=sqlite3.connect('file:data/gateway.db?mode=ro', uri=True); print(c.execute('select key_name, count(*), min(ts), max(ts) from prompt_logs group by key_name').fetchall())"
+# kolom api_keys setelah migrasi
+.venv\Scripts\python.exe -c "import sqlite3; c=sqlite3.connect('file:data/gateway.db?mode=ro', uri=True); print([r[1] for r in c.execute('pragma table_info(api_keys)')])"
 ```
+
+Saat memeriksa isi `prompt_logs` dari shell, jangan menyalin isi prompt client ke chat, commit, atau file di luar `data/`. Untuk statistik, cukup hitung baris.
 
 Migrasi: tidak ada tool. Schema dibuat otomatis saat start (lihat [database.md](database.md#migration-strategy)).
 
@@ -126,9 +165,11 @@ Tidak ada build step. Python dijalankan langsung dari source (`python -m gateway
 | Status service | `Get-Service OllamaServe, OllamaGateway, NgrokTunnel, Cloudflared` |
 | Deploy perubahan kode gateway | `Restart-Service OllamaGateway` (service menjalankan source di folder project) |
 | Deploy perubahan dependency | `uv sync`, lalu `Restart-Service OllamaGateway` |
-| Ubah setting gateway | edit `.env`, lalu `Restart-Service OllamaGateway` |
+| Ubah setting gateway | edit `.env`, lalu `Restart-Service OllamaGateway`. Daftar setting: [architecture.md#konfigurasi](architecture.md#konfigurasi-gatewayconfigpy) |
+| Deploy kode yang menambah kolom DB | `POST /admin/backup` dulu, lalu `Restart-Service OllamaGateway`; cek `database migrated: api_keys.<kolom> added` di `logs\gateway-*.log` |
+| Atur log prompt | `.env`: `PROMPT_LOG_ENABLED`, `PROMPT_LOG_RETENTION_DAYS`, `PROMPT_LOG_MAX_CHARS`, lalu restart. Per key: dashboard *Ubah* → *Catat prompt & jawaban*. Ubah retensi → perbarui `CLIENT.md#privasi` |
 | Ubah env Ollama (`NUM_PARALLEL`, context) | `scripts\install-ollama.ps1 -SkipDownload -NumParallel 2 -ContextLength 8192`, lalu samakan `GLOBAL_CONCURRENCY` di `.env` dan restart gateway |
-| Atur antrean GPU | `.env`: `QUEUE_TIMEOUT_S`, `MAX_QUEUE`, `MODEL_SWITCH_AFTER_S`, `MODEL_PARALLEL` (mis. `nama:tag=1`), `SERIAL_ARCHITECTURES`, lalu `Restart-Service OllamaGateway`. Cek arsitektur model: `Invoke-RestMethod -Method Post http://127.0.0.1:11434/api/show -Body '{"model":"<nama>"}' -ContentType application/json \| % { $_.model_info.'general.architecture' }` |
+| Atur antrean GPU | `.env`: `QUEUE_TIMEOUT_S`, `MAX_QUEUE`, `MODEL_SWITCH_AFTER_S`, `MODEL_PARALLEL` (mis. `nama:tag=1`), `SERIAL_ARCHITECTURES`, `PRIORITY_RESERVED_SLOTS`, `PRIORITY_QUEUE_TIMEOUT_S`, lalu `Restart-Service OllamaGateway`. Cek arsitektur model: `Invoke-RestMethod -Method Post http://127.0.0.1:11434/api/show -Body '{"model":"<nama>"}' -ContentType application/json \| % { $_.model_info.'general.architecture' }` |
 | Restart Ollama | `. .\scripts\common.ps1; Stop-ServiceSafe OllamaGateway; Stop-ServiceSafe OllamaServe; Start-Service OllamaServe, OllamaGateway` (jangan `Stop-Process ollama.exe`: runner yatim memegang VRAM) |
 | Upgrade Ollama / ngrok / cloudflared | `scripts\upgrade.ps1 [-Component ollama\|ngrok\|cloudflared\|all]` (Ollama: versi lama disimpan di `D:\ollama\bin.previous`, rollback otomatis bila gagal) |
 | Rollback Ollama manual | `Stop-ServiceSafe OllamaGateway; Stop-ServiceSafe OllamaServe; Rename-Item D:\ollama\bin bin.failed; Rename-Item D:\ollama\bin.previous bin; Start-Service OllamaServe, OllamaGateway` |
@@ -163,6 +204,19 @@ curl.exe -s http://127.0.0.1:11434/api/show -d '{\"model\":\"qwen3.5:4b\"}'     
 - Uji mode berpikir model baru: `reasoning_effort` `none`/`medium`/`high` lewat `/v1/chat/completions`, dengan `max_tokens` besar. Lihat [decisions.md #24](decisions.md#24-model-gemma34b-utama--qwen354b-untuk-tools-mode-berpikir-mati-secara-default).
 - Uji perbandingan model dijalankan dengan script sementara di scratchpad (bukan di repo). Metodenya: prompt Indonesia per model berurutan, `/api/chat` native untuk `eval_count`/`eval_duration`, uji beban 4 paralel, lalu warm-up `gemma3:4b` lagi.
 - Uji kapasitas (2026-10-18) juga memakai script sementara. Script mengirim N stream `/v1/chat/completions` bersamaan, langsung ke `127.0.0.1:11434/v1` dan lewat gateway `127.0.0.1:8000/v1`. Varian lain: mode soak (N worker berulang selama S detik) dan client yang putus saat antre. Selama uji, `/admin/status` di-sampling untuk melihat jumlah request berjalan per jalur; `ADMIN_KEY` diteruskan lewat env var, tidak pernah dicetak. Key sementara dibuat dengan `gateway.cli create-key --name loadtest-... --max-concurrent 16` lalu dicabut di blok `finally`. Metrik: TTFT, tok/dtk per stream, total tok/dtk, kode error, VRAM (`nvidia-smi`). Akhiri dengan memuat ulang `gemma3:4b`. Hasil: [operations.md#kapasitas](operations.md#kapasitas).
+
+## QA & uji performa
+
+Script uji tidak disimpan di repo (sekali pakai, di scratchpad agent). Pola yang dipakai, supaya bisa diulang:
+
+| Uji | Cara |
+|---|---|
+| Uji live fitur | Key sementara `qa-<fitur>` lewat admin API (`ADMIN_KEY` dari env var), kirim request ke `127.0.0.1:8000/v1` dan ke URL publik, periksa `/admin/keys`, `/admin/prompts`, access log. Key **dicabut di blok `finally`**. Log prompt key uji ikut tersimpan, jadi catat jumlahnya di [operations.md](operations.md#pekerjaan-tertunda) |
+| Soak | N worker async mengirim campuran stream/non-stream/putus-di-tengah selama S menit; hitung sukses, 499, `server_busy`, waktu tunggu p50/p95, memori proses gateway, dan (bila log prompt aktif) apakah setiap request punya baris |
+| Uji performa dashboard / DB | Jalankan **instance dev** (port 18000/18001, `DB_PATH` dan `LOG_DIR` di `%TEMP%`, lihat [Development](#development)), isi DB dev dengan baris sintetis (mis. 50 ribu baris `prompt_logs` tersebar 30 hari lewat `Database.insert_prompts`), lalu ukur `/admin/prompts` (halaman pertama, 10 halaman kursor, pencarian kata yang tidak ada) sambil mengukur `/v1/models` secara paralel. **Jangan** mengisi data sintetis ke DB produksi |
+| Query plan | `EXPLAIN QUERY PLAN` untuk SQL baru; tidak boleh ada `USE TEMP B-TREE` di query daftar (contoh: `test_prompt_list_queries_stay_on_the_ts_index`) |
+| Uji mutasi | Kembalikan sementara satu perbaikan (salin file, ubah, jalankan test terkait, pulihkan), pastikan test regresinya gagal |
+| UI dashboard | Edge headless (Playwright `channel="msedge"`, atau CDP langsung lewat `msedge.exe --headless=new --remote-debugging-port=...`): login dengan admin key dari env var, buka setiap menu, screenshot desktop 1366 px / ponsel 390 px / gelap, cek `document.documentElement.scrollWidth` (tanpa overflow) dan error console |
 
 ## Setelah PC restart
 
@@ -220,3 +274,9 @@ Masalah yang pernah terjadi:
 | ngrok berhenti melayani | Kuota bulanan paket gratis habis, atau authtoken dicabut. Cek dashboard ngrok (*Usage*) dan `D:\ollama\logs\ngrok\` |
 | API mati beberapa menit tengah malam | Windows Update me-restart PC (Event ID 1074 oleh `TrustedInstaller.exe`). Atur *Active hours* |
 | Request pertama setelah pindah model ~4 dtk | Normal: `OLLAMA_MAX_LOADED_MODELS=1`, model lain harus dimuat dulu |
+| `503 server_busy` "the server is restarting" | Normal saat service gateway di-restart (antrean dilepas, `Retry-After: 15`) |
+| `503 server_busy` "the request queue is full" | Lebih dari `MAX_QUEUE` (32) request biasa antre. Cek panel antrean / `concurrency.lanes` |
+| `429 insufficient_quota` / `401 api_key_expired` | Kebijakan per key bekerja. Ubah kuota/masa berlaku key di dashboard |
+| Admin API `503 admin_disabled` | `ADMIN_KEY` kosong di `.env` (instance dev: set `$env:ADMIN_KEY`) |
+| Menu *Prompt* kosong | Rentang waktu terlalu sempit, `PROMPT_LOG_ENABLED=false`, atau key dengan `log_prompts=0`. Lihat [operations.md](operations.md#insiden-gejala--tindakan) |
+| Test menggantung setelah membuat `Database` sendiri | Panggil `await db.close()` di `finally` (aiosqlite memakai thread, dan ada dua koneksi) |
