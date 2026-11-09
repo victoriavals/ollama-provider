@@ -17,7 +17,7 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Rate limit per key (RPM) | Completed (diuji live) |
 | Kebijakan per key: kuota token harian/bulanan, masa berlaku, model per key, prioritas | Completed (2026-10-18) |
 | Panduan client (`CLIENT.md`) + pesan siap kirim di dashboard | Completed (2026-10-18) |
-| Log prompt & jawaban (audit) + menu Prompt di dashboard | Completed (2026-11-03) |
+| Log prompt & jawaban (audit) + menu Prompt di dashboard | Completed (2026-11-03, QA + uji live + uji performa 50 ribu baris) |
 | Kontrol konkurensi (per key + antrean GPU sadar-model) | Completed (scheduler 2026-10-18, diuji live) |
 | Limit gagal-auth per IP | Completed |
 | Sanitasi request | Completed (diuji live) |
@@ -39,7 +39,7 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Script uninstall | Completed (belum pernah dijalankan) |
 | Tunnel gratis ngrok | Completed (terpasang & diuji live 2026-10-16) |
 | Cloudflare Tunnel | Tidak dipakai: script siap sebagai alternatif berbayar (pemilik memilih ngrok gratis) |
-| Retensi usage (prune) | Completed |
+| Retensi usage & log prompt (prune) | Completed |
 | Lihat [Planned](#planned) | Planned |
 
 ---
@@ -225,11 +225,14 @@ Notes:
 - **Masa berlaku:**
   - tanggal = hari terakhir berlaku; disimpan sebagai saat pertama tidak berlaku (UTC);
   - lewat → 401 `api_key_expired`, tanpa strike gagal-auth.
-- **Model per key:** di luar daftar → 404 `model_not_found` dan tidak muncul di `/v1/models`. Daftar divalidasi terhadap tabel `models`, dan daftar kosong ditolak.
+- **Model per key:** di luar daftar → 404 `model_not_found` dan tidak muncul di `/v1/models`. Daftar divalidasi terhadap tabel `models` (maks. 50), dan daftar kosong ditolak (pakai `null` untuk semua model).
+- **Stream yang diputus client** sebelum chunk usage tetap masuk kuota dengan token perkiraan (karakter prompt / 4 + jumlah chunk output), supaya kuota tidak bisa diakali dengan memutus koneksi (perbaikan QA 2026-11-03).
+- **Log prompt per key** (`log_prompts`, default aktif): dashboard *Catat prompt & jawaban*, admin API `log_prompts`, CLI `create-key --no-prompt-log`. Lihat [Log Prompt & Jawaban](#log-prompt--jawaban-audit).
+- **Prioritas:** 0–9 lewat admin API/CLI; dashboard hanya memakai 0/1 (kotak centang). Key pemilik memakai 9.
 - **Dashboard:**
   - kolom *Kuota token* (bar hari/bulan), *Akses* (model, berlaku s.d., tag *Prioritas*);
   - status *Kedaluwarsa* / *Kuota habis*;
-  - bagian *Batas lanjutan* di form; dialog *Ubah* memuat semua field;
+  - bagian *Batas lanjutan* di form; dialog *Ubah* memuat semua field tetapi hanya mengirim yang berubah;
   - tombol *Pesan*.
 
 ## Panduan Client
@@ -252,9 +255,11 @@ Notes: Pesan berisi key; kirim lewat jalur pribadi.
 
 Purpose: Pemilik bisa melihat siapa (key, IP, field `user`) mengirim prompt apa dan apa jawabannya, untuk mendeteksi akses atau pemakaian yang tidak semestinya.
 
-Status: Completed (2026-11-03). `tests/test_prompt_log.py` (11 test) + uji mutasi 7/7 + uji UI dashboard (paging, filter, cari, XSS-safe).
+Status: Completed (2026-11-03).
+- Test: `tests/test_prompt_log.py` (20 fungsi test: penangkapan, privasi, penolakan, stream, opt-out, query plan kursor, koneksi reader, prune, regresi QA termasuk estimasi stream terputus) + `tests/test_sanitize.py` (`test_messages_keep_only_exact_openai_keys`).
+- QA 2026-11-03: review kode independen (3 temuan sedang + belasan ringan, semua diperbaiki), uji mutasi (setiap perbaikan dikembalikan sementara dan test-nya gagal), uji performa 50 ribu baris, uji live di service produksi + lewat ngrok, soak 10 menit (224/224 request tercatat), uji UI dashboard (paging, filter, cari, klik ganda, XSS-safe, tanpa error console). Rincian: [operations.md#qa-log-prompt-2026-11-03](operations.md#qa-log-prompt-2026-11-03).
 
-Location: `gateway/promptlog.py`, `gateway/db.py` (`prompt_logs`, `PromptRecord`, `insert_prompts`, `list_prompts`, `get_prompt`, `prune_prompts`), `gateway/apps/public.py` (penangkapan), `gateway/proxy.py` (`Finalizer` + `ResponseCollector`), `gateway/apps/admin.py` (`/admin/prompts`), menu *Prompt* dashboard, kolom `api_keys.log_prompts`
+Location: `gateway/promptlog.py`, `gateway/db.py` (`prompt_logs`, `PromptRecord`, `insert_prompts`, `list_prompts`, `get_prompt`, `prune_prompts`, koneksi `_reader`), `gateway/apps/public.py` (penangkapan + rekam ulang dari payload bersih), `gateway/proxy.py` (`Finalizer` + `ResponseCollector` lewat `_collect`), `gateway/apps/admin.py` (`/admin/prompts`), `gateway/core.py` (`_prune_loop`), menu *Prompt* dashboard, kolom `api_keys.log_prompts`, `CLIENT.md#privasi`
 
 Important Files: `promptlog.py`, `db.py`, `proxy.py`, `apps/admin.py`, `static/dashboard/app.js` (`loadPrompts`, `renderPrompts`, `showPrompt`)
 
@@ -262,7 +267,9 @@ Dependencies: `PROMPT_LOG_ENABLED` (true), `PROMPT_LOG_RETENTION_DAYS` (30), `PR
 
 Notes:
 - **Yang tercatat:** semua pesan (system/user/assistant/tool) dan nama tools; untuk completion/embedding, input-nya. Jawaban berisi teks + tool call (stream digabung dari chunk); embedding hanya `[N embedding]`.
-- **Request yang ditolak** setelah body terbaca (model tidak diizinkan, field salah, kuota per key setelah body…) tercatat dengan statusnya: model tidak diizinkan, field salah, batas paralel per key, antrean penuh, atau habis waktu. Penolakan sebelum body terbaca (401, RPM, kuota token) hanya ada di access log.
+- **Request yang ditolak setelah body terbaca** tercatat dengan statusnya: model tidak ada/tidak diizinkan (404), field salah (400), batas paralel per key (429), antrean penuh atau habis waktu (503), client putus (499). Penolakan **sebelum** body terbaca (401, RPM, kuota token, body terlalu besar/JSON rusak, model tidak diisi) tidak punya isi, jadi hanya ada di access log dan `usage_logs`.
+- **Yang dicatat = yang diterima model:** prompt direkam ulang dari payload yang sudah disanitasi, sehingga kunci varian (`Content`) atau field yang dibuang tidak muncul di log maupun di model ([decisions.md #31](decisions.md#31-struktur-bersarang-dibangun-ulang-dari-kunci-yang-persis)).
+- **Tidak pernah mematahkan request:** penangkapan yang gagal → baris pengganti `[prompt tidak dapat dibaca untuk log]`; pengumpul jawaban yang gagal → `response` NULL.
 - **Privasi:**
   - gambar tidak disimpan;
   - teks dipotong dengan catatan `… [dipotong N karakter]`;
@@ -274,8 +281,11 @@ Notes:
   - 50 baris per halaman dengan tombol *Muat 50 lagi*, maksimal 500 di layar;
   - cuplikan dibatasi 2 baris;
   - isi lengkap baru diambil saat *Lihat* diklik;
-  - tanpa auto-refresh;
+  - tanpa auto-refresh, dan tidak dimuat ulang saat tab kembali aktif;
+  - jawaban lama dibuang bila filter sudah berubah (penjaga `seq`), tombol nonaktif selama memuat;
   - semua teks lewat `textContent`.
+- **Backend ringan:** rentang `ts` + `LIMIT` ≤ 100, kursor `ts|id` yang memakai index, koneksi read-only terpisah ([decisions.md #30](decisions.md#30-koneksi-sqlite-read-only-kedua-dan-kursor-index-friendly-untuk-log-prompt)). Terukur pada 50 ribu baris: halaman 1–2 ms, pencarian terburuk 30 hari ~190 ms, API tetap 1,5 ms selama pencarian.
+- **Batasan:** pencarian `LIKE` (bukan full-text); identitas pengguna akhir hanya ada bila client mengirim field `user`; backup DB ikut memuat log prompt.
 
 ## Limit Gagal-Auth per IP
 
@@ -303,7 +313,7 @@ Important Files: `sanitize.py` (`CHAT_FIELDS`, `COMPLETION_FIELDS`, `EMBEDDING_F
 
 Dependencies: `MAX_TOKENS_CAP`, `MAX_BODY_BYTES`, `MAX_MESSAGES`, `MAX_IMAGES`
 
-Notes: Lihat [decisions.md #8](decisions.md#8-allowlist-field-request).
+Notes: Lihat [decisions.md #8](decisions.md#8-allowlist-field-request). Sejak 2026-11-03 (QA log prompt) pesan, bagian konten, tool call, dan tools juga dibangun ulang dari kunci yang persis, karena Ollama mencocokkan kunci tanpa peduli huruf besar-kecil ([decisions.md #31](decisions.md#31-struktur-bersarang-dibangun-ulang-dari-kunci-yang-persis)).
 
 ## Usage Logging (DB)
 
@@ -317,7 +327,7 @@ Important Files: `db.py`
 
 Dependencies: Tabel `usage_logs`
 
-Notes: Ditulis batch di background. Retensi `USAGE_RETENTION_DAYS` (90), di-prune tiap 24 jam.
+Notes: Ditulis batch di background (antrean yang sama dengan log prompt). Retensi `USAGE_RETENTION_DAYS` (90), di-prune tiap 24 jam. Stream yang terputus sebelum chunk usage dicatat dengan token perkiraan.
 
 ## Log Aktivitas, Audit & Health
 
@@ -387,7 +397,7 @@ Important Files: `apps/admin.py`, `db.py`
 
 Dependencies: `ADMIN_KEY`
 
-Notes: Plaintext key hanya dikembalikan saat dibuat. Semua aksi tercatat di audit log (termasuk kebijakan per key). Sejak 2026-10-18 juga mengatur kuota token, masa berlaku, model per key, dan prioritas; daftar key menyertakan pemakaian token hari/bulan ini (lihat [Kebijakan per Key](#kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)).
+Notes: Plaintext key hanya dikembalikan saat dibuat. Semua aksi tercatat di audit log (termasuk kebijakan per key). Sejak 2026-10-18 juga mengatur kuota token, masa berlaku, model per key, dan prioritas; sejak 2026-11-03 juga `log_prompts`. Daftar key menyertakan `expired`, pemakaian token hari/bulan ini, dan `quota_resets` (lihat [Kebijakan per Key](#kebijakan-per-key-kuota-token-masa-berlaku-model-prioritas)).
 
 ## Admin: Laporan Usage
 
@@ -457,7 +467,7 @@ Important Files: `cli.py`
 
 Dependencies: Akses baca/tulis ke `data/` dan `.env` (ACL)
 
-Notes: Perubahan key berlaku di service ≤ 30 dtk. Aksi yang mengubah state tercatat di `gateway-*.log` (`gateway.cli`).
+Notes: Perubahan key berlaku di service ≤ 30 dtk. Aksi yang mengubah state tercatat di `gateway-*.log` (`gateway.cli`). `create-key` menerima `--rpm`, `--max-concurrent`, `--daily-tokens`, `--monthly-tokens`, `--expires`, `--models`, `--priority`, `--no-prompt-log`; nilainya divalidasi sebelum DB dibuka. CLI ikut menjalankan migrasi kolom saat membuka DB, jadi backup dulu setelah upgrade kode.
 
 ## Deploy Windows Service
 
@@ -475,7 +485,7 @@ Notes: Lihat [decisions.md #13](decisions.md#13-winsw-menggantikan-nssm) dan [#1
 
 ## Dashboard Admin Web
 
-Purpose: Mengontrol provider dari browser di PC server: status dependency + meter slot GPU, ringkasan hari ini, grafik request per jam, cara akses client, kelola API key, pemakaian, request terbaru, kelola model.
+Purpose: Mengontrol provider dari browser di PC server: status dependency + antrean GPU per model, ringkasan hari ini, grafik request per jam, cara akses client, kelola API key (termasuk kebijakan per key dan pesan untuk client), pemakaian, request terbaru, log prompt, kelola model.
 
 Status: Completed (2026-10-16). Diuji: 74 test, screenshot Edge headless (desktop terang/gelap, ponsel 390px, tanpa overflow, console bersih).
 
@@ -486,6 +496,8 @@ Important Files: `app.js` (vanilla JS, DOM via `h()`/`textContent`, tanpa `inner
 Dependencies: Admin API, `ADMIN_KEY`, `PUBLIC_BASE_URL` (opsional, di `.env`), `ADMIN_ALLOWED_HOSTS`
 
 Notes: Hanya di port 8001 (loopback). CSP `script-src 'self'` tanpa CDN/inline, `frame-ancestors 'none'`, `no-store`. Admin key di `sessionStorage`. Host header selain `127.0.0.1`/`localhost` → 400 (anti DNS rebinding). `group_by=hour` ditambahkan ke `/admin/usage` untuk grafik.
+
+Pembaruan: panel *Antrean GPU per model* (2026-10-18), *Batas lanjutan* + kolom *Kuota token*/*Akses* + pesan untuk client (2026-10-18), menu *Prompt* (2026-11-03). Setelah QA 2026-11-03: form kebijakan tidak lagi di-reset saat tab kembali aktif, dialog *Ubah* hanya mengirim field yang berubah, penjaga balapan di menu *Prompt*. Uji terakhir: Edge headless (desktop, ponsel 390 px, mode gelap), tanpa overflow dan tanpa error console di dashboard produksi. Perilaku rinci: [architecture.md#dashboard-frontend](architecture.md#dashboard-frontend).
 
 ## Script Status
 
@@ -571,3 +583,5 @@ Belum ada kode. Sumber: sesi desain 2026-09-27 dan permintaan pemilik sesudahnya
 | Jadwal backup DB | `POST /admin/backup` sudah ada; pemilik menolak penjadwalan untuk saat ini |
 | Notifikasi Telegram | HealthMonitor → Telegram Bot API via `httpx` (tanpa dependency baru); token bot di `.env`. Menunggu keputusan pemilik |
 | Setting `PRIMARY_MODEL` | Diperlukan bila model utama bukan model aktif pertama secara alfabet (warm-up & contoh kode dashboard) |
+| Pencarian full-text log prompt (FTS5) | Hanya bila tabel tumbuh jauh di atas 50 ribu baris dan pencarian `LIKE` terasa lambat ([decisions.md #30](decisions.md#30-koneksi-sqlite-read-only-kedua-dan-kursor-index-friendly-untuk-log-prompt)) |
+| Pemangkasan backup otomatis | Backup berisi `prompt_logs`; saat ini harus dihapus manual sesuai retensi 30 hari |
