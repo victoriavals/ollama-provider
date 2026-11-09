@@ -11,7 +11,7 @@ Kondisi mesin, jalur akses, prosedur rutin, penanganan insiden, dan konteks pemi
 | CPU / RAM | Intel i5-13400F (10C/16T), 32 GB DDR5-5600 |
 | GPU | RTX 4060 Ti 8 GB (8188 MiB), driver 610.88 (diperbarui otomatis oleh Windows Update 2026-10-17; sebelumnya 591.86), mode WDDM |
 | OS | Windows 11 Pro build 26200, tanpa monitor; diakses lewat SSH |
-| Disk | C: sisa ~53 GB, D: sisa ~135 GB. Model Ollama ~6,2 GB di `D:\ollama\models` |
+| Disk | 2026-11-03: C: sisa ~48 GB, D: sisa ~112 GB (2026-10-18: 53 / 135 GB). Model Ollama ~6,2 GB di `D:\ollama\models`. DB gateway < 1 MB |
 | Akun aktif | `dev` (Administrator; dipakai agent dan SSH pemilik), `User` (Administrator; sesi desktop console yang selalu login, pemilik profil Tailscale dan tray app Ollama), `CodexSandboxOffline`/`CodexSandboxOnline` (bukan admin; dipakai agent Codex) |
 | Software lain (di luar project) | Docker Desktop (container MongoDB untuk project lain, autostart saat "User" login), project Python lain di sesi "User" (memakai GPU ~0,4 GB), PostgreSQL, OpenSSH Server, Tailscale, VS Code, Office |
 | Agent lain | Codex juga mengedit repo ini; cek proses `codex` dan `.git/*.lock` sebelum operasi git |
@@ -48,7 +48,7 @@ Uji beban 2026-10-18: request stream dengan prompt bahasa Indonesia dan `max_tok
 VRAM tetap ~5,1 GB selama uji (cache KV dialokasikan saat model dimuat), dan utilisasi GPU ~90%.
 
 - Kapasitas nyata: **4 request bersamaan untuk gemma, 1 untuk qwen.** Throughput gemma ~265 tok/dtk, atau sekitar 50 jawaban 300 token per menit.
-- Key pemilik memakai `max_concurrent` default (2). Naikkan lewat dashboard bila aplikasinya butuh lebih banyak request bersamaan.
+- Key pemilik (`naufalnaufal`) sejak 2026-10-18: `max_concurrent` 64, RPM 100.000, prioritas 9 (slot cadangan, [decisions.md #28](decisions.md#28-jalur-cepat-key-prioritas-slot-cadangan-dan-gantian-model-seketika)). Key client baru memakai default 2 bersamaan dan 60/menit.
 
 ### Setelah scheduler sadar-model (2026-10-18)
 
@@ -116,6 +116,55 @@ Setelah deploy [decisions.md #27](decisions.md#27-kebijakan-per-key-kuota-token-
 
 Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. Label `.sr-only` ("Aksi") ternyata membuat halaman ponsel bisa digeser ke samping, sehingga `.table-wrap` kini `position: relative`. Dialog memakai kolom `minmax(0, 1fr)` agar teks panjang tidak melebarkannya.
 
+### QA log prompt (2026-11-03)
+
+Atas permintaan pemilik ("QA dan pastikan tidak ada error"), fitur log prompt ([decisions.md #29](decisions.md#29-log-prompt--jawaban-untuk-audit)) diuji sebelum dianggap selesai.
+
+**Review kode independen** (agent terpisah, read-only). Temuan sedang:
+- **M1 kunci varian.** `{"content": ..., "Content": ...}`: validasi dan log hanya melihat `content`, padahal Ollama (Go) membaca kunci tanpa peduli huruf besar-kecil. Diperbaiki dengan membangun ulang struktur dari kunci persis dan merekam log dari payload bersih ([decisions.md #31](decisions.md#31-struktur-bersarang-dibangun-ulang-dari-kunci-yang-persis)).
+- **M2 form kebijakan ter-reset.** Kembali ke tab dashboard (`visibilitychange`) me-reset form *Buat key*, sehingga key baru bisa terbuat tanpa kuota/masa berlaku yang sudah diisi. Kini form hanya di-reset saat daftar model berubah atau setelah key dibuat.
+- **M3 kuota bisa diakali.** Stream yang diputus sebelum chunk usage tercatat tanpa token, sehingga tidak masuk kuota. Kini token diestimasi (karakter prompt / 4 + jumlah chunk output).
+
+Temuan ringan yang juga diperbaiki:
+- body dengan tipe aneh membuat penangkapan crash (kini `isinstance` + baris pengganti);
+- data upstream yang janggal bisa mematahkan respons lewat pengumpul jawaban (kini `_collect` menelan error);
+- tool call stream dengan `index` sama tetapi `id` berbeda tergabung (kini dikelompokkan per id);
+- `expires_at` ekstrem (`9999-12-31`) menghasilkan 500 (kini 400);
+- giliran model baru langsung menyerah ke waiter prioritas sebelum mengisi slotnya, sehingga hanya 1 request yang jalan (kini giliran baru mengisi slot dulu);
+- setting log prompt dan argumen CLI tidak divalidasi;
+- pencarian tidak menemukan teks berkutip/baris baru di kolom JSON `prompt`;
+- dialog *Ubah* mengirim semua field (bisa menimpa perubahan lain);
+- klik ganda / ganti filter cepat di menu *Prompt* bisa menampilkan data campur;
+- file backup ikut memuat prompt (kini didokumentasikan);
+- baris yang di-prune masih tertinggal di file (kini `secure_delete=FAST`).
+
+Setiap perbaikan diberi test regresi, lalu diuji mutasi: perbaikan dikembalikan sementara dan test-nya harus gagal (empat putaran: 8/8, 5/5, 7/7, 8/8 tertangkap).
+
+**Uji performa** (instance dev, DB sintetis 50 ribu baris / 179 MB tersebar 30 hari):
+
+| Ukuran | Sebelum perbaikan | Sesudah |
+|---|---|---|
+| Halaman pertama (24 jam) | 1–2 ms | 1–2 ms |
+| Halaman berikutnya (kursor) | ~200 ms per halaman (OR multi-index + sort sementara) | 10 halaman 14 ms |
+| Pencarian terburuk (30 hari, kata tidak ada) | ~430 ms | ~190 ms (`mmap`) |
+| `/v1/models` selama pencarian berjalan | 6 → 390 ms (satu koneksi) | 1,5 ms (koneksi reader, [decisions.md #30](decisions.md#30-koneksi-sqlite-read-only-kedua-dan-kursor-index-friendly-untuk-log-prompt)) |
+
+**Uji live** (service produksi, key sementara `qa-*` yang dicabut setelahnya):
+
+| Skenario | Hasil |
+|---|---|
+| Request lewat URL publik ngrok dengan field `user` | Tercatat dengan IP client asli (entri terakhir `X-Forwarded-For`) dan `end_user` |
+| Stream, model tidak diizinkan (404), key opt-out | Jawaban stream tergabung utuh; 404 tercatat dengan statusnya; key `log_prompts=0` tidak menghasilkan baris |
+| Kasus tepi | Teks 31 ribu karakter dipotong ke 20 ribu + catatan; gambar → `[gambar ~N KB]`; tool call; `/v1/completions`; stream diputus (499, jawaban parsial tersimpan); 16 request bersamaan semuanya tercatat |
+| Kunci varian `Content` | Tidak sampai ke model, dan log hanya berisi `content` |
+| Stream diputus setelah 20 chunk | 499, token diestimasi (32) dan masuk pemakaian/kuota key |
+| `expires_at: 9999-12-31` | 400 `expires_at` (sebelumnya 500) |
+| Query admin `/admin/prompts` di produksi | ~9 ms |
+| Soak 10 menit dengan log prompt aktif | 224/224 request tercatat, 0 error |
+| Dashboard produksi (Edge headless) | Menu *Prompt*: filter, cari, *Muat 50 lagi*, *Lihat*; tanpa error console, tanpa overflow di ponsel |
+
+Sisa dari uji: 251 baris log prompt milik key `qa-*` (lihat [Pekerjaan tertunda](#pekerjaan-tertunda)).
+
 ## Jalur akses
 
 | Siapa | Jalur |
@@ -141,6 +190,20 @@ Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. La
 1. Dashboard → *Prompt*. Pilih rentang waktu (default 24 jam), lalu filter key, model, status, atau cari teks (≥ 3 huruf). Klik *Lihat* untuk isi lengkap, termasuk IP, field `user`, dan request ID.
 2. Mencurigakan? Cocokkan IP dan waktunya di `logs\access-*.log`, lalu *Cabut* key-nya dan buat key baru untuk client yang sah.
 3. Prompt key milikmu sendiri juga tercatat, kecuali opsi *Catat prompt & jawaban* di key itu dimatikan.
+4. Tanpa dashboard (lewat SSH): `/admin/prompts` dengan header admin, contohnya di [commands.md](commands.md#database).
+
+**Mematikan log prompt**
+- Untuk satu key: dashboard → *API key* → *Ubah* → hapus centang *Catat prompt & jawaban* (atau `PATCH /admin/keys/{id}` `{"log_prompts": false}`). Langsung berlaku.
+- Untuk semua key: `.env` `PROMPT_LOG_ENABLED=false`, lalu `Restart-Service OllamaGateway`. Menu *Prompt* menampilkan bahwa log dimatikan; baris lama tetap ada sampai di-prune.
+- Kalau log dimatikan permanen atau retensinya diubah (`PROMPT_LOG_RETENTION_DAYS`), perbarui juga `CLIENT.md#privasi`, karena janji ke client ada di sana.
+
+**Menghapus log prompt tertentu** (mis. baris uji `qa-*`, atau permintaan client). Tidak bisa dibatalkan, jadi **minta persetujuan pemilik dulu**:
+1. `POST /admin/backup` (backup ini ikut berisi baris yang akan dihapus; hapus juga backup itu setelah yakin).
+2. Hapus lewat koneksi biasa (service boleh tetap jalan; WAL + `busy_timeout`). Contoh untuk key uji (pastikan tidak ada client sungguhan yang namanya berawalan `qa-`):
+   `.venv\Scripts\python.exe -c "import sqlite3; c=sqlite3.connect('data/gateway.db'); print(c.execute('DELETE FROM prompt_logs WHERE key_name LIKE ?', ('qa-%',)).rowcount); c.commit()"`
+3. Cek di menu *Prompt* (rentang 30 hari). Catat di [Riwayat perubahan](#riwayat-perubahan).
+
+**Rotasi backup** (backup berisi prompt, tidak dipangkas otomatis): lihat `Get-ChildItem data\backups\*.db | Sort-Object LastWriteTime`. Backup yang lebih tua dari 30 hari sebaiknya dihapus agar janji retensi tetap benar. Minta persetujuan pemilik dulu, karena backup adalah satu-satunya titik pulih.
 
 **Menambah / mengganti model**
 1. Pull dengan `enable:false` (client tidak terpengaruh).
@@ -171,6 +234,12 @@ Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. La
 | Disk hampir penuh (health `warn`) | Hapus model tak terpakai lewat dashboard. Log terhapus otomatis setelah 30 hari, usage DB setelah 90 hari |
 | GPU panas (health `warn` ≥ 85 °C) | Cek beban dan pendinginan; health monitor mencatat transisinya |
 | API mati beberapa menit tengah malam | Windows Update me-restart PC (Event 1074). Atur *Active hours* |
+| Menu *Prompt* kosong padahal ada request | Cek rentang waktu (default 24 jam) dan filter. Respons `/admin/prompts` field `enabled` false = `PROMPT_LOG_ENABLED` mati. Key dengan *Catat prompt & jawaban* mati tidak tercatat. Penolakan sebelum body terbaca (401, RPM, kuota) memang tidak masuk log prompt. Cari `failed to write` / `prompt log capture failed` di `logs\gateway-*.log` |
+| Pencarian di menu *Prompt* terasa lambat | Persempit rentang waktu atau pilih key/model. Pencarian adalah full scan `LIKE` dalam rentang; ~0,2 dtk untuk 50 ribu baris. Bila tabel jauh lebih besar, turunkan `PROMPT_LOG_MAX_CHARS` / retensi atau pertimbangkan FTS5 |
+| Client melapor `429 insufficient_quota` | Disengaja: kuota token habis. Cek kolom *Kuota token* di dashboard. Naikkan kuota lewat *Ubah*, atau tunggu reset (00:00 / tanggal 1 WIB). `Retry-After` berisi detik sampai reset |
+| Client melapor `401 api_key_expired` | Masa berlaku habis. Perpanjang `expires_at` lewat *Ubah* (langsung berlaku), atau buat key baru |
+| Request key prioritas tetap menunggu | Normal pada qwen (1 slot, menunggu request yang berjalan) dan saat model lain aktif (menunggu request berjalan selesai + muat model ~6 dtk). Tidak ada preemption ([decisions.md #28](decisions.md#28-jalur-cepat-key-prioritas-slot-cadangan-dan-gantian-model-seketika)) |
+| `data\gateway.db` membesar | Hitung baris `prompt_logs` (perintah di [commands.md](commands.md#database)). Satu baris rata-rata ~1–4 KB; ruang yang di-prune dipakai ulang, tidak dikembalikan ke disk |
 
 ## Konteks & preferensi pemilik
 
@@ -181,6 +250,11 @@ Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. La
 - Pernah menempel authtoken ngrok di chat (sudah di-reset). Ingatkan untuk tidak menempel rahasia; arahkan agar menjalankan script sendiri.
 - Minta konfirmasi dulu sebelum: memasang/menghapus service, mengubah ACL, menghentikan proses milik user lain, me-restart PC, atau aksi apa pun yang bisa memutus akses jarak jauh.
 - Keputusan yang sudah diambil pemilik: tray app hanya dimatikan autostart-nya; gateway berjalan sebagai LocalService; `gemma3:4b` utama + `qwen3.5:4b`; `qwen3.5:9b` dihapus; Docker Desktop tidak ditutup (MongoDB project lain); backup DB terjadwal ditolak untuk saat ini.
+- **Key pemilik:** pemilik meminta key pertamanya (`naufalnaufal`) tanpa batas dan "prioritas tanpa antrean" (2026-10-18). Dipilih opsi *prioritas + slot cadangan*. Pemilik **menolak** preemption (memutus request client lain).
+- **Audit:** pemilik ingin tahu siapa memakai AI untuk apa, agar tidak sembarang orang memakai AI lokal ini (2026-11-03). Dipilih: prompt + jawaban, retensi 30 hari, menu *Prompt* di dashboard, bisa diatur per key. Prompt key pemilik sendiri ikut tercatat (default).
+- **Dashboard harus ringan:** pemilik secara eksplisit meminta agar dashboard tidak lag karena terlalu banyak log; batasi dengan filter. Jangan menambah auto-refresh atau pemuatan massal di menu *Prompt*.
+- **QA sebelum selesai:** pemilik meminta QA dan memastikan tidak ada error sebelum fitur dianggap selesai, lalu meminta semuanya didokumentasikan lengkap di `.agents/`. Pola kerja yang diharapkan: implementasi → test → QA (review independen + uji live) → dokumentasi.
+- Pemilik biasanya memilih dari opsi yang disajikan beserta rekomendasi (opsi bertanda *Recommended*). Sajikan pilihan dengan konsekuensinya bila keputusan memang milik pemilik.
 
 ## Pekerjaan tertunda
 
@@ -198,6 +272,9 @@ Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. La
 | Warm-up dengan prompt lebih panjang | Agent | Usulan kecil (kompilasi CUDA setelah update driver) |
 | Panduan singkat untuk client | Agent | **Selesai 2026-10-18**: `CLIENT.md` + pesan siap kirim di dashboard |
 | Uji `scripts\uninstall-services.ps1` | - | Belum pernah dijalankan |
+| Hapus 251 baris log prompt uji (key `qa-*`, 2026-11-03) | Pemilik memutuskan | Ditawarkan, belum disetujui. Tanpa tindakan terhapus otomatis ~2026-12-03. Prosedur: [Runbook](#runbook) |
+| Rotasi backup DB yang berisi prompt (`gateway-20261103-081048.db`, dan backup berikutnya) | Pemilik | Hapus setelah 30 hari agar sesuai janji retensi di `CLIENT.md#privasi` |
+| Log prompt & jawaban untuk audit | Agent | **Selesai 2026-11-03** (decisions #29–#31), lulus QA (lihat [QA log prompt](#qa-log-prompt-2026-11-03)) |
 
 ## Riwayat perubahan
 
@@ -208,4 +285,4 @@ Catatan dashboard: tabel key lebar (8 kolom) dan bisa digeser di dalam panel. La
 | 2026-10-16 | Audit keamanan: ACL `D:\ollama`, gateway LocalService, `image_url` hanya base64, inspector ngrok mati. `NgrokTunnel` live. Dashboard admin. `.agents/` + `CLAUDE.md`. Repo di-push publik oleh pemilik |
 | 2026-10-17 | Runner yatim dibersihkan (2,2 GB VRAM). Riset model. Ollama 0.34.4 → 0.40.5 (backup/rollback). Uji 3 model. `qwen3.5:4b` ditambahkan + kontrol `reasoning_effort`. `qwen3.5:9b` dihapus. Windows Update me-restart PC malam hari (uji reboot lulus) |
 | 2026-10-18 | Dokumentasi `.agents/` dilengkapi (file ini, pembaruan architecture/commands/memory/features/database/conventions). Uji kapasitas: gemma 4 request bersamaan, qwen hanya 1 (batasan Ollama untuk arsitektur `qwen35`). Pemilik bertanya soal antrean dengan worker terpisah; diputuskan scheduler GPU sadar-model in-process (`gateway/scheduler.py`, decisions #26), `QUEUE_TIMEOUT_S` 20 → 60, panel antrean di dashboard. Uji ulang: 12 gemma panjang 12/12 (sebelumnya 8/12), 8 qwen 8/8 (sebelumnya 6/8). Re-warm health monitor dilewati selama GPU sibuk. QA menyeluruh (review kode independen, uji live 6 skenario, soak 30 menit): 4 temuan ringan diperbaiki, shutdown kini melepas antrean dengan 503 "the server is restarting", 112 test. Kebijakan per key (decisions #27): kuota token harian/bulanan, masa berlaku, model per key, prioritas, antrean adil per key, `CLIENT.md` + pesan siap kirim di dashboard, migrasi DB aditif pertama; uji live lulus, 127 test. Atas permintaan pemilik, key `naufalnaufal` dibuat tanpa batas dan prioritas 9, lalu jalur cepat prioritas (decisions #28): slot cadangan, bebas antrean penuh, gantian model seketika; 131 test |
-| 2026-11-03 | Log prompt & jawaban untuk audit (decisions #29): tabel `prompt_logs`, per key `log_prompts`, retensi 30 hari, menu *Prompt* di dashboard (rentang waktu wajib, 50 baris per halaman, cuplikan + detail on-demand), `CLIENT.md#privasi` diperbarui; 142 test |
+| 2026-11-03 | Log prompt & jawaban untuk audit (decisions #29): tabel `prompt_logs`, per key `log_prompts`, retensi 30 hari, menu *Prompt* di dashboard (rentang waktu wajib, 50 baris per halaman, cuplikan + detail on-demand), `CLIENT.md#privasi` diperbarui; 142 test. QA menyeluruh (review independen, uji mutasi, uji performa 50 ribu baris, uji live, soak 10 menit): 3 temuan sedang + belasan ringan diperbaiki, termasuk sanitasi kunci persis (decisions #31), koneksi SQLite read-only + kursor index-friendly (decisions #30), estimasi token stream terputus; 155 test. Kode di-commit pemilik. Dokumentasi `.agents/` dilengkapi: referensi konfigurasi dan field access log (architecture), rincian kolom/ukuran `prompt_logs` (database), runbook log prompt dan rotasi backup (file ini) |
