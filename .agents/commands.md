@@ -162,7 +162,9 @@ Tidak ada build step. Python dijalankan langsung dari source (`python -m gateway
 
 | Tugas | Perintah |
 |---|---|
-| Status service | `Get-Service OllamaServe, OllamaGateway, NgrokTunnel, Cloudflared` |
+| Status service | `Get-Service OllamaServe, OllamaGateway, NgrokTunnel, Cloudflared`, atau `scripts\provider.ps1 status` |
+| **Hentikan provider** (sementara) | `powershell -ExecutionPolicy Bypass -File scripts\provider.ps1 stop` (tunnel → gateway → Ollama, semua di-set *Manual* agar tetap mati setelah reboot/listrik padam). `stop -UntilReboot` = tanpa mengubah tipe start |
+| **Jalankan provider** | `powershell -ExecutionPolicy Bypass -File scripts\provider.ps1 start` (set *Automatic*, start berurutan, tunggu `/health/ready` ≤ 90 dtk dan URL publik ≤ 45 dtk; exit 1 bila gateway tidak siap) |
 | Deploy perubahan kode gateway | `Restart-Service OllamaGateway` (service menjalankan source di folder project) |
 | Deploy perubahan dependency | `uv sync`, lalu `Restart-Service OllamaGateway` |
 | Ubah setting gateway | edit `.env`, lalu `Restart-Service OllamaGateway`. Daftar setting: [architecture.md#konfigurasi](architecture.md#konfigurasi-gatewayconfigpy) |

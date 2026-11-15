@@ -34,6 +34,7 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | CLI manajemen | Completed (diuji live) |
 | Deploy Windows Service (Ollama + gateway) | Completed (terpasang & diuji) |
 | Script status `status.ps1` | Completed (diuji live) |
+| Script stop/start provider `provider.ps1` | Completed (2026-11-09; parse-check, `status` live, `stop`/`start` lewat dry-run dengan helper tiruan. Belum dijalankan sungguhan oleh agent) |
 | Dashboard admin web (lokal) | Completed (diuji live + screenshot desktop/ponsel/gelap) |
 | Script upgrade | Completed (dipakai 2026-10-17: Ollama 0.34.4 → 0.40.5) |
 | Script uninstall | Completed (belum pernah dijalankan) |
@@ -512,6 +513,24 @@ Important Files: `status.ps1`
 Dependencies: Admin API, `ADMIN_KEY` dari `.env`, file log
 
 Notes: `-Watch <detik>` untuk refresh otomatis. Tidak butuh admin.
+
+## Script Stop/Start Provider
+
+Purpose: Pemilik bisa menghentikan provider sementara dan menyalakannya lagi sendiri, tanpa menghapus service (permintaan pemilik 2026-11-09).
+
+Status: Completed (2026-11-09). Diverifikasi: parse-check + ASCII-only, `status` dijalankan live (lokal + URL publik tanpa mencetak domain), `stop`/`stop -UntilReboot`/`start` lewat dry-run dengan `common.ps1` tiruan (urutan dan perubahan tipe start benar). Uji stop/start sungguhan oleh agent ditolak pengaman otomatis (menghentikan service produksi), jadi pemakaian sungguhan pertama dilakukan pemilik.
+
+Location: `scripts/provider.ps1`
+
+Important Files: `provider.ps1`, `common.ps1` (`Stop-ServiceSafe`, `Wait-Http`, `Assert-Admin`)
+
+Dependencies: Service `OllamaServe`, `OllamaGateway`, `NgrokTunnel` (dan `Cloudflared` bila terpasang); `PUBLIC_BASE_URL` di `.env` untuk cek publik (opsional)
+
+Notes:
+- `stop`: urutan terbalik dari start (tunnel → gateway → Ollama), tiap service di-set *Manual* lalu dihentikan lewat `Stop-ServiceSafe` (OllamaServe otomatis membersihkan runner yatim). `-UntilReboot` membiarkan tipe start *Automatic*.
+- `start`: set *Automatic*, start berurutan, tunggu `http://127.0.0.1:<Port>/health/ready` (90 dtk), lalu URL publik `/health` (45 dtk, header `ngrok-skip-browser-warning`).
+- `status`: tidak butuh admin; domain publik dibaca dari `.env` tetapi tidak pernah dicetak.
+- `stop` dan `start` butuh shell Administrator (`Assert-Admin`).
 
 ## Script Upgrade
 

@@ -328,6 +328,23 @@ Select-String logs\health-*.log -Pattern WARNING                                
 
 ## Operasional
 
+### Menghentikan & menjalankan provider
+
+Dari PowerShell **Administrator** di folder project (atau lewat SSH sebagai `dev`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\provider.ps1 stop     # API offline, GPU bebas, tetap mati walau PC restart
+powershell -ExecutionPolicy Bypass -File scripts\provider.ps1 start    # nyalakan lagi (kembali otomatis saat boot)
+powershell -ExecutionPolicy Bypass -File scripts\provider.ps1 status   # cek (tidak perlu Administrator)
+powershell -ExecutionPolicy Bypass -File scripts\provider.ps1 stop -UntilReboot   # mati sampai PC restart berikutnya saja
+```
+
+- `stop` mematikan tunnel lebih dulu (tidak ada request baru), lalu gateway (request yang berjalan diberi waktu 10 detik), lalu Ollama (VRAM dibebaskan, runner yatim dibersihkan). Ketiga service diubah ke *Manual*, jadi provider **tetap mati setelah restart atau listrik padam** sampai `start` dijalankan.
+- `start` mengembalikan service ke *Automatic*, menjalankannya berurutan, lalu menunggu API siap (lokal dan lewat URL publik). Model selesai dimuat beberapa detik kemudian.
+- Selama berhenti, client mendapat error dari ngrok (endpoint offline) dan dashboard (port 8001) ikut mati. SSH dan Tailscale tidak terpengaruh. API key, kuota, dan log tetap utuh.
+
+### Perintah lain
+
 | | |
 |---|---|
 | Status service | `Get-Service OllamaServe, OllamaGateway, NgrokTunnel` |

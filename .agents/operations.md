@@ -215,7 +215,9 @@ Sisa dari uji: 251 baris log prompt milik key `qa-*` (lihat [Pekerjaan tertunda]
 
 **Cek harian:** `scripts\status.ps1`, atau dashboard *Ringkasan*. Health monitor mencatat setiap perubahan status ke `logs\health-*.log`.
 
-**Setelah restart PC:** tidak ada langkah manual. Lihat [commands.md#setelah-pc-restart](commands.md#setelah-pc-restart).
+**Menghentikan provider sementara** (permintaan pemilik 2026-11-09): `scripts\provider.ps1 stop`, lalu `scripts\provider.ps1 start` untuk menyalakan lagi (perintah lengkap di [commands.md](commands.md#deployment)). `stop` men-set service ke *Manual*, sehingga provider tidak hidup sendiri setelah listrik padam atau restart. Selama berhenti, dashboard ikut mati; SSH/Tailscale tetap jalan. **Agent tidak menjalankan `stop`/`start` tanpa diminta pemilik**, karena itu mematikan API produksi.
+
+**Setelah restart PC:** tidak ada langkah manual (kecuali provider sedang dihentikan dengan `provider.ps1 stop`: service *Manual*, jalankan `provider.ps1 start`). Lihat [commands.md#setelah-pc-restart](commands.md#setelah-pc-restart).
 
 ## Insiden: gejala → tindakan
 

@@ -148,6 +148,7 @@ Aturan operasional tambahan:
 | `scripts/install-ngrok.ps1` | Pasang tunnel aktif (service `NgrokTunnel`) | Mengisi `WATCH_SERVICES` + `PUBLIC_BASE_URL` di `.env` |
 | `scripts/upgrade.ps1` | Upgrade Ollama/ngrok/cloudflared | Ollama: backup `bin.previous` + rollback otomatis |
 | `scripts/status.ps1` | Ringkasan operasional satu layar | Tidak butuh admin |
+| `scripts/provider.ps1` | `stop` / `start` / `status` seluruh provider untuk pemilik | `stop` men-set service *Manual* (tetap mati setelah reboot). Jangan dijalankan agent tanpa diminta |
 | `D:\ollama\ngrok\ngrok.yml` | Config ngrok berisi authtoken + domain (di luar repo) | **Sensitif**, ber-ACL protected |
 | `.env` | Secret (`ADMIN_KEY`) + konfigurasi | **Sensitif**, gitignored, ber-ACL |
 | `data/gateway.db` | Hash API key, usage, **isi prompt & jawaban** (`prompt_logs`) | **Sensitif**, gitignored, ber-ACL. Begitu pula `data/backups/` |
