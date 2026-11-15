@@ -1,7 +1,7 @@
 # Project Memory: ollama-provider
 
 > **Baca file ini sebelum mengubah apa pun.** Ini ringkasan tertinggi. Detail ada di file lain di `.agents/` (lihat [Dokumentasi lain](#dokumentasi-lain)).
-> Terakhir diperbarui: 2026-11-03. Semua isi berasal dari kode di repository, kecuali bagian yang ditandai *(observasi mesin)*. Kondisi mesin, prosedur operasional, dan konteks pemilik ada di [operations.md](operations.md).
+> Terakhir diperbarui: 2026-11-15. Semua isi berasal dari kode di repository, kecuali bagian yang ditandai *(observasi mesin)*. Kondisi mesin, prosedur operasional, dan konteks pemilik ada di [operations.md](operations.md).
 > **Repo ini publik di GitHub:** jangan menulis rahasia, domain ngrok, IP, atau token di `.agents/`.
 
 ## Ringkasan project
@@ -10,15 +10,15 @@
 |---|---|
 | Nama | `ollama-provider` (`pyproject.toml`) |
 | Tujuan | Menyajikan model Ollama lokal sebagai **API OpenAI-compatible** yang bisa diakses dari internet, dengan API key per client, rate limit, usage log, admin API, dan log pemantauan |
-| Jenis | Backend API gateway / reverse proxy + dashboard admin web lokal (`/admin/ui`, statis, vanilla JS) |
+| Jenis | Backend API gateway / reverse proxy + dashboard admin web lokal (`/admin/ui`, React/Next.js static export; vanilla sebagai fallback sebelum build) |
 | Target pengguna | Aplikasi client yang memakai SDK OpenAI, LangChain, atau curl (README). Identitas pengguna akhir: *Unknown - information not available in repository* |
 | Bahasa | Python 3.11 (gateway), PowerShell 5.1 (script deploy) |
 | Framework | FastAPI 0.141 / Starlette 1.7, uvicorn 0.54, httpx 0.28, pydantic-settings 2.15 |
 | Database | SQLite (via aiosqlite 0.22), file `data/gateway.db` |
 | Upstream | Ollama (`http://127.0.0.1:11434`), memakai endpoint OpenAI-compat `/v1/*` dan native `/api/*` |
 | Infrastruktur | Windows 11, GPU NVIDIA (RTX 4060 Ti 8 GB), Ollama 0.40.5, Windows Service via **WinSW v2.12**, tunnel publik **ngrok** (gratis, aktif). Cloudflare Tunnel tersedia sebagai alternatif berbayar |
-| Package manager | `uv` (`uv.lock`) |
-| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **155 test** |
+| Package manager | `uv` (`uv.lock`) untuk Python, npm (`frontend/package-lock.json`) untuk frontend |
+| Test | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + respx, **161 test Python + 16 test Playwright** |
 | Bahasa dokumentasi | Indonesia (README, `.agents/`), komentar kode dalam Bahasa Inggris |
 
 ## Arsitektur singkat
@@ -105,6 +105,8 @@ Pemilik --SSH via Tailscale, port forward 8001--> dashboard
       - Stream yang terputus sebelum chunk usage kini diestimasi (token per chunk + perkiraan prompt) dan masuk kuota.
     - **Data sensitif:** `prompt_logs` dan file di `data/backups/` berisi prompt client. Jangan menyalin isinya ke chat, commit, atau script; hapus baris (di luar prune) hanya dengan persetujuan pemilik. Rincian kolom dan ukuran: [database.md](database.md#prompt_logs). Runbook: [operations.md](operations.md#runbook).
 
+23. **Dashboard React/Next.js static export** (2026-11-15, atas permintaan pemilik, [decisions.md #32](decisions.md#32-dashboard-reactnextjs-dengan-static-export-dan-csp-hash)). Source di `frontend/`; `npm run build` menghasilkan release dan manifest CSP. Tetap dilayani FastAPI/port admin, tanpa proses Node produksi. Jangan mengedit build atau mengendurkan CSP. Preview `npm run preview` memakai data simulasi di port 18001; log prompt tetap manual dan terbatas 500 baris. Toolkit global dipasang pada akun dev; Motion/Context7 menunggu OAuth. Perubahan ini belum diaktifkan melalui restart service produksi.
+
 ## Aturan wajib untuk AI Agent
 
 1. Selalu membaca `.agents/memory.md` sebelum melakukan perubahan.
@@ -143,7 +145,7 @@ Aturan operasional tambahan:
 | `gateway/db.py` | Schema, migrasi aditif, query, `UsageWriter` (usage + log prompt), koneksi read-only `_reader` | Satu-satunya tempat SQL |
 | `tests/conftest.py` | Fixture test (`gw`, `public`, `admin`, `new_key`, `hold_slots`, `scheduler_idle`, `flush_usage`), mock Ollama | Test default memakai `priority_reserved_slots=0` |
 | `gateway/config.py` | Semua setting (env / `.env`) | |
-| `gateway/static/dashboard/` | Dashboard admin (`index.html`, `app.css`, `app.js`) | Tanpa `innerHTML`/CDN; CSP ketat dari `apps/admin.py` |
+| `frontend/`, `gateway/dashboard.py` | Dashboard React/Next.js dan penyajian manifest/CSP | Build statis, API admin lama; lihat `frontend/README.md`. Fallback vanilla di `gateway/static/dashboard/` |
 | `scripts/common.ps1` | Helper deploy (WinSW, `Stop-ServiceSafe`, `Remove-OrphanOllamaRunners`, `Protect-AdminOnlyTree`, download) | Dipakai semua script |
 | `scripts/install-ngrok.ps1` | Pasang tunnel aktif (service `NgrokTunnel`) | Mengisi `WATCH_SERVICES` + `PUBLIC_BASE_URL` di `.env` |
 | `scripts/upgrade.ps1` | Upgrade Ollama/ngrok/cloudflared | Ollama: backup `bin.previous` + rollback otomatis |

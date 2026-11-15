@@ -61,11 +61,20 @@ curl.exe http://127.0.0.1:18000/v1/chat/completions -H "Authorization: Bearer sk
 ## Testing
 
 ```powershell
-uv run pytest                                    # semua test (155), Ollama di-mock, tanpa jaringan, ~6 dtk
+uv run pytest                                    # semua test (161), Ollama di-mock, tanpa jaringan, ~6 dtk
 uv run pytest tests/test_proxy.py -q             # satu file
 uv run pytest -k stream -q                       # filter nama test
 uv run pytest tests/test_scheduler.py tests/test_key_policy.py tests/test_prompt_log.py -q   # antrean, kebijakan key, log prompt
-node --check gateway/static/dashboard/app.js     # syntax dashboard (Node 20 terpasang di mesin ini)
+cd frontend
+npm ci                                          # Node 24, dependency dari lockfile
+npm run typecheck
+npm run lint
+npm run format:check
+npm run build                                   # static export + manifest CSP
+npm test                                        # Edge, API simulasi di 18001; preview manual harus berhenti
+npm run preview                                 # demo-admin, data di memori, http://127.0.0.1:18001/admin/ui
+# Ctrl+C untuk menghentikan preview, lalu kembali ke root:
+cd ..
 ```
 
 | File test | Cakupan |

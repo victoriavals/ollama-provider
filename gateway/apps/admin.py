@@ -2,12 +2,10 @@
 
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
-from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -15,6 +13,7 @@ from ..auth import display_prefix, generate_key, hash_key, require_admin
 from ..config import BASE_DIR
 from ..core import Gateway
 from ..db import days_ago, utcnow
+from ..dashboard import ui
 from ..errors import APIError, install_handlers
 from ..middleware import RequestContextMiddleware
 from ..quota import iso_utc, local_now, local_periods, parse_expiry
@@ -301,39 +300,6 @@ async def backup(request: Request) -> dict:
     await _gw(request).db.backup(dest)
     audit.info("database backup written to %s", dest)
     return {"path": str(dest)}
-
-
-# ---- Dashboard (static files, no secrets: the page asks for ADMIN_KEY itself) --
-
-UI_DIR = Path(__file__).resolve().parent.parent / "static" / "dashboard"
-UI_FILES = {"app.js": "text/javascript", "app.css": "text/css"}
-# The page holds the admin key in memory: no third-party code, no framing, no inline script.
-UI_HEADERS = {
-    "Content-Security-Policy": ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
-    "X-Frame-Options": "DENY",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "Cache-Control": "no-store",
-}
-ui = APIRouter(include_in_schema=False)
-
-
-@ui.get("/")
-async def ui_root() -> RedirectResponse:
-    return RedirectResponse("/admin/ui")
-
-
-@ui.get("/admin/ui")
-async def ui_index() -> FileResponse:
-    return FileResponse(UI_DIR / "index.html", media_type="text/html", headers=UI_HEADERS)
-
-
-@ui.get("/admin/ui/{name}")
-async def ui_asset(name: str) -> FileResponse:
-    if name not in UI_FILES:
-        raise APIError(404, "Not Found")
-    return FileResponse(UI_DIR / name, media_type=UI_FILES[name], headers=UI_HEADERS)
 
 
 def create_admin_app(gw: Gateway) -> FastAPI:

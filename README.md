@@ -210,6 +210,8 @@ Atur juga **Settings → Windows Update → Advanced options → Active hours**.
 
 ### Dashboard
 
+Dashboard baru memakai **React + Next.js static export**, dengan tema terang/gelap, visual antrean GPU, kartu ponsel, filter, dan panel detail. Cara build serta preview simulasi ada di **[frontend/README.md](frontend/README.md)**; hasil audit dan validasi ada di **[docs/uiux-redesign.md](docs/uiux-redesign.md)**. Produksi tetap dilayani FastAPI; tidak memerlukan runtime Node. Checkout tanpa build memakai dashboard vanilla sebagai fallback.
+
 Dashboard ada di **`http://127.0.0.1:8001/admin/ui`** dan hanya bisa dibuka dari PC server. Dari jauh, pakai **SSH port forwarding**:
 
 ```bash
@@ -454,6 +456,18 @@ uv run python -m gateway                   # Ctrl+C untuk berhenti
 ```
 
 Perubahan kode langsung aktif di produksi setelah `Restart-Service OllamaGateway`, karena service menjalankan source dari folder ini.
+
+### Frontend dashboard
+
+Setelah `uv sync`, jalankan dari folder `frontend/`:
+
+```powershell
+npm ci
+npm run build
+npm run preview
+```
+
+Preview **http://127.0.0.1:18001/admin/ui** memakai key **`demo-admin`** dan data simulasi di memori. Untuk QA: `npm run typecheck`, `npm run lint`, `npm run format:check`, dan `npm test`. Toolkit global tersedia untuk akun pengguna; Motion/Context7 memerlukan OAuth terpisah. Lihat [panduan frontend](frontend/README.md).
 
 ### Dokumentasi untuk AI agent
 

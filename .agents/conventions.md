@@ -104,7 +104,7 @@ data/  logs/        runtime, gitignored, jangan di-commit
 
 ## Testing rules
 
-- `uv run pytest` harus hijau (saat ini 155 test, ~6 dtk). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
+- `uv run pytest` harus hijau (saat ini 161 test, ~6 dtk). `asyncio_mode = "auto"`, jadi test async cukup ditulis sebagai `async def`.
 - Ollama selalu di-mock: fixture `ollama` (respx `MockRouter`) dipasang ke `Gateway(..., ollama_transport=httpx.MockTransport(router.async_handler))`.
 - Gunakan fixture: `gw`, `public`, `admin`, `api_key`, `auth`, dan helper di `tests/conftest.py`:
   - `new_key(gw, name, **limits)`: key dengan kebijakan apa pun (`daily_token_limit`, `allowed_models`, `priority`, `log_prompts`, ...);
@@ -121,20 +121,18 @@ data/  logs/        runtime, gitignored, jangan di-commit
 - Query daftar baru: tambahkan test `EXPLAIN QUERY PLAN` seperti `test_prompt_list_queries_stay_on_the_ts_index`.
 - Periksa access log lewat `caplog` pada logger `gateway.access`.
 
-## Dashboard rules (`gateway/static/dashboard/`)
+## Dashboard rules (`frontend/`, `gateway/dashboard.py`)
 
-- Vanilla HTML/CSS/JS tanpa framework, build step, CDN, atau font eksternal. CSP `script-src 'self'; style-src 'self'` melarang script/style inline, jadi semua JS ada di `app.js` dan CSS di `app.css`. Style dinamis hanya lewat CSSOM (`el.style.width = ...`), bukan atribut `style`.
-- Bangun DOM dengan helper `h()` / `s()` dan `textContent`. **Dilarang** `innerHTML` / `insertAdjacentHTML` (dicek `test_dashboard_is_served_with_strict_headers`).
-- Warna, ukuran, dan spasi hanya dari token CSS di `:root` (`--surface-*`, `--ink*`, `--accent*`, status `--good/--warning/--serious/--critical`), dengan varian `prefers-color-scheme: dark`. Status selalu ikon + teks, tidak pernah warna saja.
-- Copy UI dalam Bahasa Indonesia, sentence case; tombol menyebut aksinya ("Buat key", "Cabut key").
-- Semua panggilan lewat `api()` (Bearer admin key dari `sessionStorage`); 401 → kembali ke layar login. Data baru dari backend ditambahkan ke admin API, bukan diambil langsung dari Ollama.
-- File baru harus didaftarkan di `UI_FILES` (`apps/admin.py`); route aset memakai whitelist.
-- `app.js` adalah ES module: fungsi tidak tersedia di `window`. Uji UI lewat interaksi DOM (klik, isi form), bukan memanggil fungsi langsung.
-- Menu yang datanya bisa besar (contoh: *Prompt*) tidak ikut auto-refresh maupun `visibilitychange`, wajib punya filter rentang waktu, memuat per halaman (`next`), membatasi jumlah baris di layar, dan mengambil detail hanya saat diminta.
-- Setiap pemuatan async yang bisa tumpang tindih memakai penjaga urutan (`seq`): jawaban lama dibuang bila sudah ada permintaan baru. Tombol dinonaktifkan selama memuat.
-- Form yang sedang diisi tidak boleh di-reset oleh polling atau `visibilitychange`. Dialog ubah hanya mengirim field yang berubah (PATCH parsial).
-- Tabel lebar dibungkus `.table-wrap` (`overflow-x: auto; position: relative`); kolom dialog `minmax(0, 1fr)` dan teks panjang memakai `pre.code.wrap`, supaya halaman ponsel tidak bisa digeser ke samping.
-- Setelah mengubah tampilan: `node --check gateway/static/dashboard/app.js`, lalu screenshot desktop 1366 px / ponsel 390 px / mode gelap (Edge headless via Playwright `channel="msedge"` atau CDP langsung), dan pastikan `scrollWidth` tidak melebihi lebar layar serta tidak ada error console.
+- React/Next.js dengan static export telah diotorisasi pemilik (#32). Dashboard vanilla lama hanya fallback sebelum build tersedia.
+- Dependency runtime per proyek dan terkunci `package-lock.json`; gunakan Node 24. Font/aset/script lokal, tanpa CDN. Jangan memasukkan admin key ke build, log, URL, atau storage persisten.
+- Semua teks API dirender sebagai teks React; jangan gunakan `dangerouslySetInnerHTML` atau `insertAdjacentHTML`. Pemeriksaan source dan uji XSS browser menggantikan pemeriksaan substring bundle React.
+- Gunakan komponen shadcn dan token semantik, copy Indonesia sentence case, touch target 44 px, judul/deskripsi dialog, pengembalian focus, keyboard, serta reduced motion.
+- Pertahankan semua kebijakan key. Form memakai validasi native + pesan error per field. Tombol pending dan pengunci sinkron wajib untuk mutation; PATCH hanya field yang berubah.
+- Semua API melalui provider auth: Bearer dari sesi tab, 401/logout membatalkan request dan menghapus cache. Jangan memanggil Ollama atau endpoint publik dari dashboard.
+- Prompt: rentang waktu wajib, 50 baris/halaman, maksimum 500, detail lazy, tanpa polling/focus/reconnect. Gunakan AbortSignal untuk query yang dapat tumpang tindih.
+- Jangan mengubah CSP menjadi `unsafe-inline`/`unsafe-eval`. Manifest dan hash skrip dibuat oleh build. Overlay native menghindari stylesheet scroll-lock dinamis. Aset baru didaftarkan otomatis oleh exporter sesuai tipe yang didukung.
+- Jalankan `npm run typecheck`, `npm run lint`, `npm run format:check`, `npm run build`, dan `npm test` dari `frontend/`; perubahan Python juga `uv run pytest` dari root. Playwright memakai Edge, API simulasi, 390/768/1366 px, kedua tema, axe, dan screenshot. Jangan memakai data produksi untuk screenshot.
+- Lihat `frontend/AGENTS.md` dan dokumentasi Next.js terpasang (`node_modules/next/dist/docs/`) sebelum API framework baru. Keputusan visual/API baru harus tetap menjaga batas produksi dan kompatibilitas.
 
 ## PowerShell script rules
 

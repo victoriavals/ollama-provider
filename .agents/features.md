@@ -35,7 +35,7 @@ Status: **Completed** (ada di kode dan lulus test), **In Progress**, **Planned**
 | Deploy Windows Service (Ollama + gateway) | Completed (terpasang & diuji) |
 | Script status `status.ps1` | Completed (diuji live) |
 | Script stop/start provider `provider.ps1` | Completed (2026-11-09; parse-check, `status` live, `stop`/`start` lewat dry-run dengan helper tiruan. Belum dijalankan sungguhan oleh agent) |
-| Dashboard admin web (lokal) | Completed (diuji live + screenshot desktop/ponsel/gelap) |
+| Dashboard admin web (lokal) | Completed (legacy diuji live; redesign React/Next.js 2026-11-15: 16 test browser + screenshot/axe desktop/tablet/ponsel terang/gelap, belum restart produksi) |
 | Script upgrade | Completed (dipakai 2026-10-17: Ollama 0.34.4 → 0.40.5) |
 | Script uninstall | Completed (belum pernah dijalankan) |
 | Tunnel gratis ngrok | Completed (terpasang & diuji live 2026-10-16) |
@@ -490,15 +490,17 @@ Purpose: Mengontrol provider dari browser di PC server: status dependency + antr
 
 Status: Completed (2026-10-16). Diuji: 74 test, screenshot Edge headless (desktop terang/gelap, ponsel 390px, tanpa overflow, console bersih).
 
-Location: `gateway/static/dashboard/` (`index.html`, `app.css`, `app.js`), route `GET /admin/ui` di `gateway/apps/admin.py`
+Location: source React/Next.js di `frontend/`, manifest dan rute statis di `gateway/dashboard.py`; vanilla di `gateway/static/dashboard/` sebagai fallback sebelum build.
 
-Important Files: `app.js` (vanilla JS, DOM via `h()`/`textContent`, tanpa `innerHTML`), `apps/admin.py` (`UI_HEADERS`, `TrustedHostMiddleware`, `/admin/info`)
+Important Files: `frontend/components/providers.tsx`, `frontend/views/`, `frontend/scripts/export.mjs`, `gateway/dashboard.py`; kontrak admin tetap di `apps/admin.py`.
 
 Dependencies: Admin API, `ADMIN_KEY`, `PUBLIC_BASE_URL` (opsional, di `.env`), `ADMIN_ALLOWED_HOSTS`
 
 Notes: Hanya di port 8001 (loopback). CSP `script-src 'self'` tanpa CDN/inline, `frame-ancestors 'none'`, `no-store`. Admin key di `sessionStorage`. Host header selain `127.0.0.1`/`localhost` → 400 (anti DNS rebinding). `group_by=hour` ditambahkan ke `/admin/usage` untuk grafik.
 
 Pembaruan: panel *Antrean GPU per model* (2026-10-18), *Batas lanjutan* + kolom *Kuota token*/*Akses* + pesan untuk client (2026-10-18), menu *Prompt* (2026-11-03). Setelah QA 2026-11-03: form kebijakan tidak lagi di-reset saat tab kembali aktif, dialog *Ubah* hanya mengirim field yang berubah, penjaga balapan di menu *Prompt*. Uji terakhir: Edge headless (desktop, ponsel 390 px, mode gelap), tanpa overflow dan tanpa error console di dashboard produksi. Perilaku rinci: [architecture.md#dashboard-frontend](architecture.md#dashboard-frontend).
+
+Redesign 2026-11-15: 16 test Playwright (termasuk 401, empty/expiry/quota/reflow, XSS, mutation dan CSP) serta 161 test Python. Dua negative control menonaktifkan pengunci submit / validasi native dan berhasil ditangkap regresi. Screenshot 390/768/1366 px dua tema dan axe tersedia pada laporan frontend. Preview terisolasi; belum ada restart produksi.
 
 ## Script Status
 

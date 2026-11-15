@@ -134,9 +134,12 @@ async def test_dashboard_is_served_with_strict_headers(admin):
     csp = r.headers["content-security-policy"]
     assert "script-src 'self'" in csp and "frame-ancestors 'none'" in csp and "unsafe-inline" not in csp
     assert r.headers["x-frame-options"] == "DENY" and r.headers["cache-control"] == "no-store"
-    js = await admin.get("/admin/ui/app.js")
-    assert js.status_code == 200 and js.headers["content-type"].startswith("text/javascript")
-    assert ".innerHTML" not in js.text and "insertAdjacentHTML" not in js.text  # text via textContent only
+    import re
+    scripts = re.findall(r'<script\b[^>]*\bsrc="([^"]+)"', r.text)
+    assert scripts
+    for src in scripts:
+        js = await admin.get(src)
+        assert js.status_code == 200 and js.headers["content-type"].startswith("text/javascript")
     assert (await admin.get("/admin/ui/../../.env")).status_code == 404
     assert (await admin.get("/admin/ui/index.html")).status_code == 404
     assert (await admin.get("/", follow_redirects=False)).headers["location"] == "/admin/ui"

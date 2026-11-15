@@ -42,17 +42,14 @@ Pemilik -SSH (Tailscale) -L 8001-> :8001 admin app + /admin/ui -+     db | limit
 
 ## Dashboard (frontend)
 
-- File statis di `gateway/static/dashboard/` (`index.html`, `app.css`, `app.js`), disajikan app admin di `/admin/ui` tanpa auth. Halaman meminta `ADMIN_KEY` lalu memanggil admin API dengan header Bearer.
-- Vanilla JS (ES module) tanpa framework, build step, atau CDN. DOM dibangun lewat helper `h()`/`s()` dengan `textContent`; `innerHTML` dilarang (dicek test). Grafik SVG buatan sendiri.
-- Keamanan: CSP `default-src 'none'; script-src 'self'; style-src 'self'; ... frame-ancestors 'none'`, `X-Frame-Options: DENY`, `Cache-Control: no-store`, `TrustedHostMiddleware` (`ADMIN_ALLOWED_HOSTS`, anti DNS rebinding), admin key di `sessionStorage`.
-- Menu (`data-view`): *Ringkasan* (status dependency, panel *Antrean GPU per model* dari `concurrency.lanes`), *API key* (buat/ubah/cabut, *Batas lanjutan* untuk kebijakan per key, pesan untuk client), *Pemakaian* (`/admin/usage`), *Request* (`/admin/usage/recent`), *Prompt* (log prompt), dan *Model* (allowlist, pull, hapus).
-- Polling: status tiap 10 dtk (`REFRESH_MS`). Halaman Ringkasan dan Request diperbarui otomatis; job pull diperbarui tiap 2 dtk selama ada yang berjalan. Form tidak pernah di-reset saat polling atau saat tab kembali aktif (`visibilitychange`). Form kebijakan key baru hanya di-reset saat daftar model berubah atau setelah key dibuat. Admin GET yang sukses tidak dicatat di access log.
-- Menu *Prompt* sengaja **tidak** ikut auto-refresh maupun `visibilitychange`. Isinya:
-  - rentang waktu wajib (1 jam s.d. 30 hari);
-  - 50 baris per permintaan, tombol *Muat 50 lagi* (kursor `next`), maksimal `PROMPT_MAX_ROWS` = 500 baris di tabel;
-  - penjaga `state.prompts.seq`: jawaban dari permintaan lama dibuang bila filter sudah berubah, dan tombol dinonaktifkan selama memuat;
-  - isi lengkap baru diambil (`/admin/prompts/{id}`) saat *Lihat* diklik, ditampilkan di `dialog.wide`.
-- Dialog *Ubah* key hanya mengirim field yang berubah (`policyFields.changed()`), sehingga PATCH tidak menimpa nilai yang diubah di tempat lain.
+- Source React 19/Next.js 16 App Router di `frontend/`. Semua halaman diekspor statis; tidak ada server Node atau service tambahan di produksi.
+- `npm run build` membuat release baru di `gateway/static/dashboard/build/`, manifest halaman/aset, dan hash SHA-256 skrip inline. Pointer `active.json` diganti atomik. `gateway/dashboard.py` membatasi akses ke manifest, menjaga CSP tanpa `unsafe-inline`/`unsafe-eval`, menolak path asing, dan menyimpan `Cache-Control: no-store`.
+- Rute `/admin/ui/`, `keys/`, `usage/`, `requests/`, `prompts/`, `models/` mendukung deep link, Back/Forward, dan migrasi hash lama. Checkout tanpa build menggunakan fallback vanilla lama.
+- Halaman meminta `ADMIN_KEY`; hanya browser yang memegangnya di sesi tab. Login memvalidasi `/admin/info`, semua data lewat admin API, dan logout/401 membatalkan request serta membersihkan cache TanStack Query.
+- Polling status 10 detik, Ringkasan/Request 10 detik ketika aktif, job unduhan 2 detik selama berjalan. Form tidak di-reset oleh polling. PATCH key hanya mengirim field berubah, dan pengunci sinkron mencegah kiriman ganda.
+- Prompt tetap manual: rentang wajib, 50 baris per halaman, maksimum 500, detail diambil saat dibuka, dan tidak refetch pada focus/reconnect. Query menerima AbortSignal untuk mengabaikan respons lama.
+- Tema terang/gelap/sistem, preferensi gerak, font lokal, kartu ponsel, grafik keyboard/touch dengan tabel alternatif. Overlay memakai dialog native (focus trap/inert/Escape) dengan judul primitive shadcn agar tidak menginjeksi stylesheet runtime yang ditolak CSP.
+- Preview/test memakai API simulasi di memori pada loopback 18001. Tidak membaca DB, `.env`, prompt produksi, atau menghubungi Ollama. Panduan lengkap di `frontend/README.md`.
 
 ## Resolusi IP client
 
@@ -193,7 +190,7 @@ Pemetaan error transport (`proxy.map_transport_error`): ConnectError/ConnectTime
 | GET | `/admin/status` | `HealthMonitor.check()` live: komponen dependency + `gateway.concurrency` (`global_limit`, `active`, `waiting`, `closed`, `reserved_slots`, `max_queue`, `switch_after_s`, `turn{model, age_s, yielding}`, `lanes[{model, capacity, reserved, running, waiting, oldest_wait_s, priority_waiting}]`, `stats{granted, expired, rejected, switches}`, `per_key_in_flight`) |
 | POST | `/admin/backup` | `VACUUM INTO data/backups/gateway-<ts>.db` (termasuk `prompt_logs`) |
 | GET | `/admin/info` | `public_base_url`, `client_guide_url`, `defaults{rpm, max_concurrent, global_concurrency, max_tokens_cap}`, `models` (aktif) |
-| GET | `/admin/ui`, `/admin/ui/app.js`, `/admin/ui/app.css` | Dashboard statis (tanpa auth; halaman meminta `ADMIN_KEY`), header CSP ketat. `GET /` → redirect ke sini |
+| GET | `/admin/ui`, `/admin/ui/{page-or-asset}` | Dashboard statis berbasis manifest (tanpa auth; halaman meminta `ADMIN_KEY`), header CSP ketat. `GET /` → redirect ke sini |
 
 Swagger admin tersedia di `/admin/docs` (tanpa auth, tapi hanya bisa diakses dari loopback).
 
@@ -345,6 +342,6 @@ Env service di luar `Settings` (dibuat script install, di XML WinSW `D:\ollama\s
 4. `GLOBAL_CONCURRENCY` harus sama dengan `OLLAMA_NUM_PARALLEL` (di XML service `OllamaServe`). Scheduler mengasumsikan `OLLAMA_MAX_LOADED_MODELS=1` (satu model berjalan sekaligus). Model yang dipaksa 1 slot oleh Ollama harus tercakup `SERIAL_ARCHITECTURES` atau `MODEL_PARALLEL`.
 5. Request non-stream sebaiknya selesai < 100 dtk (batas first-byte Cloudflare; dijaga lewat `MAX_TOKENS_CAP` dan `QUEUE_TIMEOUT_S` 60 dtk + generasi ≤ ~30 dtk), supaya tetap aman bila tunnel dipindah ke Cloudflare.
 6. Kode baru yang blocking harus lewat `asyncio.to_thread`. Event loop dipakai bersama oleh kedua server.
-7. Dashboard tetap statis dan tanpa dependency pihak ketiga. Fitur baru memakai admin API yang ada, bukan endpoint publik.
+7. Dashboard tetap static export. Dependency frontend dibundel lokal dan dikunci lockfile; tidak ada CDN. Fitur baru memakai admin API yang ada, bukan endpoint publik.
 8. Endpoint generasi baru juga wajib: cek kuota setelah RPM, cek `key.may_use(model)`, dan menangkap prompt (`new_record` setelah body terbaca, lalu `capture_prompt(payload)` setelah sanitasi). Usage, kuota (`quota.add`), dan log prompt hanya dicatat lewat `Finalizer` atau jalur `except APIError` di `_generate`, supaya tidak ada request yang lolos dari kuota maupun audit.
 9. Bacaan admin yang bisa berat (rentang waktu panjang, pencarian teks) memakai `Database._read_all` (koneksi read-only) dan selalu dibatasi rentang waktu + `LIMIT`. Semua penulisan tetap di koneksi utama. Daftar hanya mengembalikan cuplikan; isi lengkap diambil per baris.

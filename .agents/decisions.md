@@ -651,3 +651,23 @@ Alternative Considered:
 - Menolak request yang berisi kunci varian (400): lebih tegas, tetapi bisa mematahkan client yang mengirim field tambahan secara tidak sengaja.
 - Normalisasi huruf kecil lalu ambil yang terakhir: meniru perilaku Go, tetapi rapuh bila parser upstream berubah.
 - Mencatat body mentah di log: log tidak lagi mencerminkan apa yang diterima model.
+
+
+---
+
+## 32. Dashboard React/Next.js dengan static export dan CSP hash
+
+Date: 2026-11-15
+
+Context: Pemilik meminta audit UI/UX menyeluruh, redesign ekspresif/animatif dengan React/Next.js, dan toolkit global. Audit simulasi mereproduksi POST key ganda, pengiriman angka edit tidak valid, tabel ponsel lebar, dialog tanpa nama, grafik hover-only, dan kontras CTA rendah. Pemilik memilih static export melalui FastAPI serta Node 24.
+
+Decision:
+- React/Next.js App Router, TypeScript, Tailwind, shadcn, TanStack Query; Motion/GSAP/React Bits untuk interaksi. Runtime Lottie/Rive disiapkan sebagai dependency untuk aset lanjutan, tidak dimuat pada halaman awal.
+- Tidak menambah server Node, service, schema DB, atau kontrak API publik. Exporter membuat release terpisah, manifest aset/halaman, dan hash CSP skrip bootstrap. Pointer aktif atomik, dengan fallback vanilla bila belum build.
+- Semua script/font/aset lokal. CSP tanpa unsafe-inline/eval. Dialog native menjaga focus/inert tanpa stylesheet scroll-lock dinamis; judul memakai primitive shadcn.
+- Pertahankan auth per tab, pembatalan request dan penghapusan cache pada logout/401, PATCH parsial, secret sekali tampil, serta prompt manual (50/halaman, maks 500, detail lazy).
+- Toolkit global berada pada scope akun dev; CLI lama clasp/corepack dipertahankan, prefix npm pengguna tetap tersedia antar versi Node. Motion/Context7 dikonfigurasi, autentikasi OAuth pemilik terpisah.
+
+Impact: 161 test Python dan 16 test Playwright lulus; enam halaman diuji 390/768/1366 px terang/gelap dengan axe, screenshot, CSP dan navigasi. Preview terisolasi memakai API in-memory pada loopback. Tidak ada restart/deploy produksi, commit, atau push pada pekerjaan ini.
+
+Reason: Menambah kualitas UI dan alat pengembangan sambil mempertahankan arsitektur gateway satu proses dan batas admin lokal. Source frontend serta lockfile dilacak; build menjadi artifact yang dapat dibangun ulang. Detail di frontend/README.md dan docs/uiux-redesign.md.
