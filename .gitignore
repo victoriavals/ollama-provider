@@ -16,3 +16,6 @@ frontend/*.tsbuildinfo
 frontend/test-results/
 frontend/playwright-report/
 gateway/static/dashboard/build/
+
+# Local portfolio export artifacts.
+/portfolio-export/
